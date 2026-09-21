@@ -6744,18 +6744,45 @@ NOL3.pages.planning = function (root) {
         renderDeliveryAreas();
         renderIncomingOrders();
         updateIncomingOrdersNotification();
+        renderPlanningExceptions();
+        const fp = document.getElementById('planningFleetProductivity');
+        if (fp && typeof getFleetProductivityTarget === 'function') fp.value = String(getFleetProductivityTarget());
       }, 0);
     });
 
-    window.addEventListener("businessdatechange", () => {
-      // Business Date changes must refresh every date-dependent Planning view
-      // immediately. Total Volume remains the current LM snapshot by design;
-      // date-scoped dispatch/backlog/town/delivery views use the selected date.
-      setTimeout(() => {
-        if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics();
-        renderOnFloorTowns();
-        renderDeliveryAreas();
-      }, 0);
+    window.addEventListener("businessdatechange", async (event) => {
+      // Business Date selects the active dated LM snapshot. Always restore that
+      // snapshot BEFORE rendering any derived Planning values. The old handler
+      // only refreshed the cards, so switching away from today and back left
+      // lmInventory empty and Total Volume/Town counts stayed at zero.
+      const date = String(event?.detail?.businessDate || (NOL3.getBusinessDateValue && NOL3.getBusinessDateValue()) || "").trim();
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
+
+      try {
+        if (!event?.detail?.lmAlreadyLoaded && typeof NOL3.loadLMHistoryForDate === "function") {
+          await NOL3.loadLMHistoryForDate(date);
+        }
+      } catch (error) {
+        console.warn("NOL3: Could not restore LM snapshot for business date.", date, error);
+      }
+
+      // loadLMHistoryForDate dispatches inventoryloaded and rebuilds
+      // filteredRows. Re-render once more after the awaited restore so all
+      // Planning cards and town lists use the restored dataset.
+      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+      renderOnFloorTowns();
+      renderDeliveryAreas();
+      renderIncomingOrders();
+      updateIncomingOrdersNotification();
+      if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
+
+      // Keep the Fleet Productivity control in sync with the hub-scoped value
+      // after date changes/re-renders. Fleet Productivity is hub-scoped, not
+      // date-scoped, so changing Business Date must never reset it to 50.
+      const fp = document.getElementById('planningFleetProductivity');
+      if (fp && typeof getFleetProductivityTarget === 'function') {
+        fp.value = String(getFleetProductivityTarget());
+      }
     });
 
     const townToggleBtn = document.getElementById("townToggleBtn");
