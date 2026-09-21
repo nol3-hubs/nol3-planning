@@ -5278,6 +5278,11 @@ NOL3.pages.planning = function (root) {
         store.byHub = store.byHub && typeof store.byHub === 'object' ? store.byHub : {};
         store.byHub[getPlanningHubKey()] = getPlanningSnapshot();
         NOL3Storage.set(PLANNING_LAYOUT_KEY, JSON.stringify(store));
+        // Town groups / delivery-area arrangements are part of the synced
+        // hub settings channel.
+        window.dispatchEvent(new CustomEvent("planningchanged", {
+          detail: { type: "town-arrangement", source: "local" }
+        }));
       } catch (error) {
         console.warn('NOL3: Could not save planning layout.', error);
       }
@@ -8461,6 +8466,14 @@ NOL3.pages.riders = function (root) {
     },
     getHistories() {
       return Array.from(histories.values()).map(clone);
+    },
+    clearOperational() {
+      records.delete("lm");
+      records.delete("incoming");
+      records.delete("linehaul");
+      records.delete("unifiedInventory");
+      records.delete("unifiedInventoryUndo");
+      histories.clear();
     }
   };
 })();
@@ -8693,8 +8706,11 @@ NOL3.pages.riders = function (root) {
         try { await NOL3.clearUploadedData(type); } catch (_) {}
       }
 
-      try { if (NOL3._storageRemove) await NOL3._storageRemove("unifiedInventory"); } catch (_) {}
-      try { if (NOL3._storageRemove) await NOL3._storageRemove("unifiedInventoryUndo"); } catch (_) {}
+      // Remove every browser-local operational record, including ALL LM
+      // history dates. Clearing only today's LM history is not sufficient:
+      // restoreSavedUploads can otherwise resurrect an older saved snapshot
+      // during the next page load.
+      try { NOL3FileStore?.clearOperational?.(); } catch (_) {}
       try { if (NOL3._inventoryUndoMemory) NOL3._inventoryUndoMemory = null; } catch (_) {}
 
       NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
@@ -8716,7 +8732,10 @@ NOL3.pages.riders = function (root) {
       if (filesChannel) {
         filesChannel.initialized = true;
         filesChannel.lastHash = "";
+        filesChannel.lastLocalMutationAt = 0;
+        filesChannel.lastRemoteUpdatedAt = 0;
         filesChannel.allowEmptyPush = true;
+        try { localStorage.removeItem(filesChannel.metaKey); } catch (_) {}
       }
 
       try {
@@ -10453,11 +10472,38 @@ NOL3.pages.riders = function (root) {
       NOL3.riderData = null;
     }
   });
-  // Cloud writes are manual only. Local edits/uploads are no longer auto-saved.
-  window.addEventListener("planningchanged", () => {});
-  window.addEventListener("zonechanged", () => {});
-  window.addEventListener("inventoryloaded", () => {});
-  window.addEventListener("inventorycleared", () => {});
+  // Auto-save local changes after the initial cloud restore has completed.
+  // Cloud-originated events are ignored so a remote restore cannot immediately
+  // echo itself back as a new local version.
+  window.addEventListener("planningchanged", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+  });
+
+  window.addEventListener("zonesettingschanged", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+  });
+
+  window.addEventListener("businessdatechange", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+  });
+
+  window.addEventListener("inventoryloaded", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud" || event?.detail?.source === "hub-local") return;
+    const type = event?.detail?.type;
+    if (type === "riders") {
+      schedulePushCheck(rosterChannel, syncSettingsAndRoster);
+    } else if (type === "lm" || type === "incoming" || type === "linehaul") {
+      schedulePushCheck(filesChannel, syncFiles);
+    }
+  });
+
+  window.addEventListener("inventorycleared", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(filesChannel, syncFiles);
+  });
 })();
 </script>
 </body>
