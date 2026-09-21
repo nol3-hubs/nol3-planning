@@ -4531,7 +4531,7 @@ NOL3.pages.planning = function (root) {
         NOL3.currentBusinessDate = value;
         saveBusinessDateValue(value);
         dateInput.value = value;
-        renderBusinessDayMetrics();
+        // Wait for the dated LM snapshot to load before rendering derived metrics.
         window.dispatchEvent(new CustomEvent("businessdatechange", { detail: { businessDate: value, source: "picker" } }));
       };
 
@@ -4574,14 +4574,9 @@ NOL3.pages.planning = function (root) {
       const input = document.getElementById('businessDayDate');
       if (input) input.value = normalized;
       window.dispatchEvent(new CustomEvent('businessdatechange', { detail: { businessDate: normalized } }));
-      // Refresh the currently visible page as well as the topbar.
-      setTimeout(() => {
-        try {
-          const page = NOL3.getState && NOL3.getState().currentPage;
-          if (typeof NOL3.renderTopbar === 'function') NOL3.renderTopbar();
-          if (page && typeof NOL3.renderPage === 'function') NOL3.renderPage(page);
-        } catch (_) {}
-      }, 0);
+      // The async businessdatechange handler restores the dated snapshot and
+      // rebuilds all derived views before the page is rendered.
+      if (typeof NOL3.renderTopbar === 'function') NOL3.renderTopbar();
     };
 
     // Always derive TODAY at the moment NOW is pressed. Do not rely on the
@@ -6053,12 +6048,24 @@ NOL3.pages.planning = function (root) {
       const hub = (NOL3.getState && NOL3.getState().selectedHub) || '';
       return `${base}:${String(hub).trim() || '__NO_HUB__'}`;
     };
+    const getFleetProductivityStorageKey = () => {
+      const hub = (NOL3.getState && NOL3.getState().selectedHub) || '';
+      return `${PLANNING_FP_KEY}:${String(hub).trim() || '__NO_HUB__'}`;
+    };
     const getFleetProductivityTarget = () => {
-      try { const value = Number(NOL3Storage.get(PLANNING_FP_KEY)); return Number.isFinite(value) && value > 0 ? value : 50; } catch (error) { return 50; }
+      try {
+        const hubKey = getFleetProductivityStorageKey();
+        const scoped = NOL3Storage.get(hubKey);
+        const value = Number(scoped);
+        if (Number.isFinite(value) && value > 0) return value;
+        // Preserve the existing target once, then future saves are hub-scoped.
+        const legacy = Number(NOL3Storage.get(PLANNING_FP_KEY));
+        return Number.isFinite(legacy) && legacy > 0 ? legacy : 50;
+      } catch (error) { return 50; }
     };
     const saveFleetProductivityTarget = value => {
       const numeric = Number(value); if (!Number.isFinite(numeric) || numeric <= 0) return;
-      try { NOL3Storage.set(PLANNING_FP_KEY, String(numeric)); } catch (error) {}
+      try { NOL3Storage.set(getFleetProductivityStorageKey(), String(numeric)); } catch (error) {}
     };
     const loadPlanningExceptions = () => {
       try { const raw = NOL3Storage.get(getPlanningHubStorageKey(PLANNING_EXCEPTION_KEY)); const parsed = raw ? JSON.parse(raw) : []; return Array.isArray(parsed) ? parsed.map(String).map(v => v.trim()).filter(Boolean) : []; } catch (error) { return []; }
@@ -6683,7 +6690,13 @@ NOL3.pages.planning = function (root) {
     });
 
     const planningFleetProductivity = document.getElementById('planningFleetProductivity');
-    planningFleetProductivity?.addEventListener('change', event => { const value=Number(event.target.value); if(!Number.isFinite(value)||value<=0){event.target.value=String(getFleetProductivityTarget());return;} saveFleetProductivityTarget(value); renderDeliveryAreas(); });
+    planningFleetProductivity?.addEventListener('change', event => {
+      const value=Number(event.target.value);
+      if(!Number.isFinite(value)||value<=0){event.target.value=String(getFleetProductivityTarget());return;}
+      saveFleetProductivityTarget(value);
+      renderDeliveryAreas();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'fleet-productivity',source:'local'}})); } catch (_) {}
+    });
     const planningExceptionInput = document.getElementById('planningExceptionInput');
     const refreshAllExceptionAffectedViews = () => {
       // Planning Exceptions are global: refresh every view that derives an
@@ -6696,10 +6709,23 @@ NOL3.pages.planning = function (root) {
       if (typeof renderOnFloorTowns === 'function') renderOnFloorTowns();
       if (typeof renderParcelRecords === 'function') renderParcelRecords();
     };
-    const addPlanningException = () => { const value=String(planningExceptionInput?.value||'').trim(); if(!value)return; const current=loadPlanningExceptions(); if(!current.some(item=>item.toLowerCase()===value.toLowerCase())) current.push(value); savePlanningExceptions(current); if(planningExceptionInput)planningExceptionInput.value=''; refreshAllExceptionAffectedViews(); };
+    const addPlanningException = () => {
+      const value=String(planningExceptionInput?.value||'').trim();
+      if(!value)return;
+      const current=loadPlanningExceptions();
+      if(!current.some(item=>item.toLowerCase()===value.toLowerCase())) current.push(value);
+      savePlanningExceptions(current);
+      if(planningExceptionInput)planningExceptionInput.value='';
+      refreshAllExceptionAffectedViews();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'planning-exceptions',source:'local'}})); } catch (_) {}
+    };
     document.getElementById('planningExceptionAdd')?.addEventListener('click',addPlanningException);
     planningExceptionInput?.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addPlanningException();}});
-    document.getElementById('planningExceptionClear')?.addEventListener('click',()=>{savePlanningExceptions([]);refreshAllExceptionAffectedViews();});
+    document.getElementById('planningExceptionClear')?.addEventListener('click',()=>{
+      savePlanningExceptions([]);
+      refreshAllExceptionAffectedViews();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'planning-exceptions',source:'local'}})); } catch (_) {}
+    });
 
     loadPlanningLayout();
 
@@ -9490,9 +9516,39 @@ NOL3.pages.riders = function (root) {
       if (!event.detail?.lmAlreadyLoaded) {
         await NOL3.loadLMHistoryForDate(date);
       }
-      if (typeof NOL3.updateInventoryUploadSummaries === "function") await NOL3.updateInventoryUploadSummaries();
-      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+
+      // Rebuild filteredRows from the snapshot that was just loaded. Total
+      // Volume and Town counts are derived from this hub-filtered dataset.
+      const hub = (NOL3.getState && NOL3.getState().selectedHub) || "";
+      const lm = NOL3.lmInventory || {};
+      const rows = Array.isArray(lm.rows) ? lm.rows : [];
+      const headers = Array.isArray(lm.headers) ? lm.headers : [];
+      const normalizedHeaders = headers.map(h => String(h || "").trim().toLowerCase());
+      const stationIndex = normalizedHeaders.indexOf("current station");
+
+      if (!hub) {
+        lm.filteredRows = rows.slice();
+      } else if (stationIndex >= 0) {
+        const target = String(hub).trim().toLowerCase();
+        lm.filteredRows = rows.filter(row =>
+          String(row?.[stationIndex] || "").trim().toLowerCase() === target
+        );
+      } else {
+        lm.filteredRows = [];
+      }
+
+      if (typeof NOL3.updateInventoryUploadSummaries === "function") {
+        await NOL3.updateInventoryUploadSummaries();
+      }
+
+      // Render only after the correct dated dataset is active.
+      const page = NOL3.getState && NOL3.getState().currentPage;
       if (typeof NOL3.renderTopbar === "function") NOL3.renderTopbar();
+      if (page && typeof NOL3.renderPage === "function") NOL3.renderPage(page);
+      if (typeof NOL3.renderBusinessDayMetrics === "function") {
+        NOL3.renderBusinessDayMetrics();
+        setTimeout(() => NOL3.renderBusinessDayMetrics(), 0);
+      }
     } catch (error) {
       console.warn("NOL3: Could not switch LM snapshot for Business Date.", error);
     } finally {
@@ -10054,7 +10110,7 @@ NOL3.pages.riders = function (root) {
       businessDate: NOL3Storage.get("nol3_business_day_date_v1") || "",
       businessDaySettings: NOL3Storage.get("nol3_business_day_settings_v1") || "",
       planningLayout: planningByHub?.[hub] || null,
-      fleetProductivity: NOL3Storage.get("nol3_fleet_productivity_v1") || "",
+      fleetProductivity: NOL3Storage.get("nol3_fleet_productivity_v1:" + hub) || NOL3Storage.get("nol3_fleet_productivity_v1") || "",
       planningExceptions: exceptionStore,
       zoneOverrides: overrideStore[hub] || {},
       zoneSettings: zoneSettingsStore[hub] || {},
@@ -10070,7 +10126,7 @@ NOL3.pages.riders = function (root) {
       if (state.businessDate) NOL3Storage.set("nol3_business_day_date_v1", String(state.businessDate));
       if (state.businessDaySettings) NOL3Storage.set("nol3_business_day_settings_v1", String(state.businessDaySettings));
       if (state.fleetProductivity !== undefined && state.fleetProductivity !== "") {
-        NOL3Storage.set("nol3_fleet_productivity_v1", String(state.fleetProductivity));
+        NOL3Storage.set("nol3_fleet_productivity_v1:" + HUB_NAME, String(state.fleetProductivity));
       }
       if (Array.isArray(state.planningExceptions)) {
         NOL3Storage.set("nol3_planning_exceptions_v1:" + HUB_NAME, JSON.stringify(state.planningExceptions));
