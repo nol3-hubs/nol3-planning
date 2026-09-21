@@ -9521,14 +9521,21 @@ NOL3.pages.riders = function (root) {
       // Refresh only the views that depend on the dated LM dataset. Avoid a
       // full renderPage() because rebuilding the entire DOM can be expensive
       // with large uploads and was unnecessary for a date switch.
-      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
-      if (typeof renderOnFloorTowns === "function") renderOnFloorTowns();
-      if (typeof renderDeliveryAreas === "function") renderDeliveryAreas();
-      if (typeof renderIncomingOrders === "function") renderIncomingOrders();
-      if (typeof updateIncomingOrdersNotification === "function") updateIncomingOrdersNotification();
-      if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
-      if (typeof renderUnassignedOrders === "function") renderUnassignedOrders();
-      if (typeof renderParcelRecords === "function") renderParcelRecords();
+      const renderAfterDateRestore = () => {
+        if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+        if (typeof renderOnFloorTowns === "function") renderOnFloorTowns();
+        if (typeof renderDeliveryAreas === "function") renderDeliveryAreas();
+        if (typeof renderIncomingOrders === "function") renderIncomingOrders();
+        if (typeof updateIncomingOrdersNotification === "function") updateIncomingOrdersNotification();
+        if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
+        if (typeof renderUnassignedOrders === "function") renderUnassignedOrders();
+        if (typeof renderParcelRecords === "function") renderParcelRecords();
+      };
+      renderAfterDateRestore();
+      requestAnimationFrame(() => {
+        renderAfterDateRestore();
+        setTimeout(renderAfterDateRestore, 50);
+      });
     } catch (error) {
       console.warn("NOL3: Could not switch LM snapshot for Business Date.", error);
     } finally {
@@ -9543,6 +9550,10 @@ NOL3.pages.riders = function (root) {
   const refresh = () => {
     if (typeof NOL3.renderBusinessDayMetrics !== "function") return;
     NOL3.renderBusinessDayMetrics();
+    requestAnimationFrame(() => NOL3.renderBusinessDayMetrics());
+    setTimeout(() => {
+      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+    }, 50);
   };
   window.addEventListener("inventoryloaded", event => {
     if (event.detail?.type === "lm") refresh();
