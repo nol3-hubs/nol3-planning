@@ -10631,6 +10631,10 @@ NOL3.pages.riders = function (root) {
     if (type === "riders") {
       schedulePushCheck(rosterChannel, () => syncSettingsAndRoster(true));
     } else if (type === "lm" || type === "incoming" || type === "linehaul") {
+      // Historical/date-switch restores are LOCAL views of a saved snapshot.
+      // They must NEVER overwrite the shared current operational dataset in
+      // Supabase. Only a real upload (or an explicit clear) may push files.
+      if (event?.detail?.historical === true || event?.detail?.source === "historical") return;
       // A real upload intentionally supersedes the previous Clear tombstone.
       filesChannel.lastRemoteClearedByUser = false;
       schedulePushCheck(filesChannel, () => syncFiles(true));
