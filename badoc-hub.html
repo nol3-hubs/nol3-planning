@@ -9531,6 +9531,15 @@ NOL3.pages.riders = function (root) {
         if (typeof renderUnassignedOrders === "function") renderUnassignedOrders();
         if (typeof renderParcelRecords === "function") renderParcelRecords();
       };
+      // Rebuild the active page once after the dated snapshot is fully loaded.
+      // The metric elements can be recreated by the page renderer; updating
+      // only the old DOM nodes is why the data sometimes appeared only after
+      // a manual Refresh. This is still much cheaper than a full app reload.
+      try {
+        const currentPage = NOL3.state?.currentPage || "planning";
+        if (typeof NOL3.renderPage === "function") NOL3.renderPage(currentPage);
+      } catch (_) {}
+
       renderAfterDateRestore();
       requestAnimationFrame(() => {
         renderAfterDateRestore();
