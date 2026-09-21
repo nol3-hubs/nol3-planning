@@ -8724,26 +8724,14 @@ NOL3.pages.riders = function (root) {
       try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
       try { if (typeof renderPlanning === "function") renderPlanning(); } catch (_) {}
 
-      // Make the intentional empty files snapshot authoritative in Supabase.
-      // Mark the channel initialized first so a startup/initial-sync read
-      // cannot restore the old cloud snapshot immediately before the clear
-      // is written.
-      const filesChannel = window.NOL3CloudSync?.channels?.files;
-      if (filesChannel) {
-        filesChannel.initialized = true;
-        filesChannel.lastHash = "";
-        filesChannel.lastLocalMutationAt = 0;
-        filesChannel.lastRemoteUpdatedAt = 0;
-        filesChannel.allowEmptyPush = true;
-        try { localStorage.removeItem(filesChannel.metaKey); } catch (_) {}
-      }
-
-      try {
-        if (window.NOL3CloudSync?.syncNow) {
-          await window.NOL3CloudSync.syncNow();
-        }
-      } finally {
-        if (filesChannel) filesChannel.allowEmptyPush = false;
+      // Write the cleared operational snapshot directly to the files channel.
+      // This is a deliberate user action, so an empty snapshot is valid.
+      // A clearedAt/cledByUser tombstone also prevents the normal startup
+      // merge logic from treating the empty snapshot as missing data.
+      if (window.NOL3CloudSync?.clearUploadedFilesCloud) {
+        await window.NOL3CloudSync.clearUploadedFilesCloud();
+      } else {
+        throw new Error("Cloud sync is not ready. Please wait for CONNECTED • SYNCED before clearing.");
       }
 
       alert(
@@ -9924,6 +9912,7 @@ NOL3.pages.riders = function (root) {
     },
     async applyRemote(data) {
       if (!data) return;
+      filesChannel.lastRemoteClearedByUser = data.clearedByUser === true;
 
       if (data.lmInventory) {
         const lm = data.lmInventory;
@@ -10241,6 +10230,18 @@ NOL3.pages.riders = function (root) {
     const remoteSnapshot = remote.data;
     const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
     const localTime = Math.max(savedRemoteTime, channel.lastLocalMutationAt || 0);
+
+    // A deliberate Clear is an authoritative empty snapshot. Never merge old
+    // browser-local uploads back into it.
+    if (channel === filesChannel && remoteSnapshot?.clearedByUser === true) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      try { localStorage.setItem(channel.metaKey, String(remoteTime)); } catch (_) {}
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
     const localHasData = snapshotHasData(channel, local);
     const remoteHasData = snapshotHasData(channel, remoteSnapshot);
 
@@ -10343,9 +10344,15 @@ NOL3.pages.riders = function (root) {
     try {
       const local = await channel.buildSnapshot();
       const currentHash = stableHash(local);
-      if (currentHash !== channel.lastHash && allowPush && (snapshotHasData(channel, local) || channel.allowEmptyPush)) {
+      if (
+        currentHash !== channel.lastHash &&
+        allowPush &&
+        (snapshotHasData(channel, local) || channel.allowEmptyPush) &&
+        !(channel === filesChannel && channel.lastRemoteClearedByUser)
+      ) {
         channel.lastLocalMutationAt = Date.now();
         local.clientUpdatedAt = channel.lastLocalMutationAt;
+        if (channel === filesChannel) channel.lastRemoteClearedByUser = false;
         await pushSnapshotFor(channel, local);
         channel.lastHash = stableHash(await channel.buildSnapshot());
         channel.lastRemoteUpdatedAt = channel.lastLocalMutationAt;
@@ -10370,10 +10377,10 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function syncSettingsAndRoster() {
+  async function syncSettingsAndRoster(allowPush = false) {
     try {
-      const a = await syncChannelOnce(settingsChannel);
-      const b = await syncChannelOnce(rosterChannel);
+      const a = await syncChannelOnce(settingsChannel, allowPush);
+      const b = await syncChannelOnce(rosterChannel, allowPush);
       status(a || b ? "SYNCED • CLOUD UPDATE" : "CONNECTED • LIVE", true);
       if (a || b) {
         try {
@@ -10386,9 +10393,9 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function syncFiles() {
+  async function syncFiles(allowPush = false) {
     try {
-      const reload = await syncChannelOnce(filesChannel);
+      const reload = await syncChannelOnce(filesChannel, allowPush);
       if (reload) {
         try {
           if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
@@ -10418,8 +10425,40 @@ NOL3.pages.riders = function (root) {
     channel.pushTimer = setTimeout(() => runner(), channel.debounceMs);
   }
 
+  async function clearUploadedFilesCloud() {
+    const emptySnapshot = {
+      version: 4,
+      hubId: HUB_ID,
+      hubName: HUB_NAME,
+      hubCode: HUB_CODE,
+      clientUpdatedAt: Date.now(),
+      clearedAt: Date.now(),
+      clearedByUser: true,
+      lmInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      incomingInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      lineHaulInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      arrivedIncomingTasks: []
+    };
+
+    await pushSnapshotFor(filesChannel, emptySnapshot);
+    filesChannel.initialized = true;
+    filesChannel.lastHash = stableHash(emptySnapshot);
+    filesChannel.lastRemoteUpdatedAt = emptySnapshot.clientUpdatedAt;
+    filesChannel.lastLocalMutationAt = emptySnapshot.clientUpdatedAt;
+    filesChannel.lastRemoteClearedByUser = true;
+    try { localStorage.setItem(filesChannel.metaKey, String(emptySnapshot.clientUpdatedAt)); } catch (_) {}
+    return emptySnapshot;
+  }
+
   window.NOL3CloudSync = {
     syncNow: syncOnce,
+    clearUploadedFilesCloud,
     hubId: HUB_ID,
     hubName: HUB_NAME,
     hubCode: HUB_CODE
@@ -10477,26 +10516,26 @@ NOL3.pages.riders = function (root) {
   // echo itself back as a new local version.
   window.addEventListener("planningchanged", (event) => {
     if (applyingRemote || event?.detail?.source === "cloud") return;
-    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
   });
 
   window.addEventListener("zonesettingschanged", (event) => {
     if (applyingRemote || event?.detail?.source === "cloud") return;
-    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
   });
 
   window.addEventListener("businessdatechange", (event) => {
     if (applyingRemote || event?.detail?.source === "cloud") return;
-    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
   });
 
   window.addEventListener("inventoryloaded", (event) => {
     if (applyingRemote || event?.detail?.source === "cloud" || event?.detail?.source === "hub-local") return;
     const type = event?.detail?.type;
     if (type === "riders") {
-      schedulePushCheck(rosterChannel, syncSettingsAndRoster);
+      schedulePushCheck(rosterChannel, () => syncSettingsAndRoster(true));
     } else if (type === "lm" || type === "incoming" || type === "linehaul") {
-      schedulePushCheck(filesChannel, syncFiles);
+      schedulePushCheck(filesChannel, () => syncFiles(true));
     }
   });
 
