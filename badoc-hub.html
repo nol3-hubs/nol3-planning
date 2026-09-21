@@ -3369,28 +3369,26 @@ window.NOL3.escapeHTML = function(value) {
             console.warn('NOL3: Could not save undo point; upload will continue.', e);
           }
 
-          // ALL uploads start from the saved Unified Inventory snapshot.
-          // This is the critical stacking rule: a normal file can never wipe
-          // the previous inventory just because it is not a Forward Order file.
-          const previousHeaders = Array.isArray(previousRecord?.dataset?.headers)
-            ? previousRecord.dataset.headers
-            : [];
-          const previousRows = Array.isArray(previousRecord?.dataset?.rows)
-            ? previousRecord.dataset.rows
-            : [];
+          // A unified upload can be either an LM inventory export, an Incoming
+          // inventory/transfer export, or a mixed export.
+          //
+          // IMPORTANT:
+          // - An LM-only upload replaces LM data but PRESERVES the current Incoming data.
+          // - An Incoming-only upload replaces Incoming data but PRESERVES the current LM data.
+          // - A mixed upload replaces both partitions with the contents of that upload.
+          //
+          // This prevents an Incoming transfer file (for example, trans.csv) from
+          // wiping the LM snapshot that drives Town counts, On-Floor Orders and
+          // Total Volume. Planning settings, zones, town arrangements, exceptions,
+          // and riders are stored separately and are never touched here.
 
-          // Retain the existing columns and append any columns that exist only
-          // in the newly uploaded file.
-          const canonicalHeaders = [...previousHeaders];
-          headers.forEach(h => {
-            if (!canonicalHeaders.some(x => String(x).trim().toLowerCase() === String(h).trim().toLowerCase())) {
-              canonicalHeaders.push(h);
-            }
-          });
+          const canonicalHeaders = Array.isArray(headers) ? [...headers] : [];
           const canonIndex = new Map(canonicalHeaders.map((h,i) => [String(h).trim().toLowerCase(), i]));
+
           const toCanonical = (row, rowHeaders) => {
+            if (rowHeaders === canonicalHeaders) return [...row];
             const out = Array(canonicalHeaders.length).fill('');
-            rowHeaders.forEach((h,i) => {
+            (Array.isArray(rowHeaders) ? rowHeaders : []).forEach((h,i) => {
               const j = canonIndex.get(String(h).trim().toLowerCase());
               if (j !== undefined) out[j] = row[i] ?? '';
             });
@@ -3400,62 +3398,109 @@ window.NOL3.escapeHTML = function(value) {
           const orderIndex = canonIndex.get('order id');
           if (orderIndex === undefined) throw new Error('Order ID column not found');
 
-          // Seed the map with the PREVIOUS SNAPSHOT for every upload, then apply
-          // the new upload. The new file therefore can NEVER become the entire
-          // active dataset by itself.
-          const mergedMap = new Map();
-          let addedCount = 0, updatedCount = 0;
-
-          const putLatest = (row, sourceHeaders, isIncoming) => {
-            const mapped = sourceHeaders === canonicalHeaders ? row : toCanonical(row, sourceHeaders);
-            const id = String(mapped[orderIndex] ?? '').trim();
-            if (!id) return;
-
-            if (!mergedMap.has(id)) {
-              mergedMap.set(id, mapped);
-              if (isIncoming) addedCount++;
-              return;
-            }
-
-            const existing = mergedMap.get(id);
-            const existingTime = getLMRowLatestTimestamp(existing, canonicalHeaders);
-            const incomingTime = getLMRowLatestTimestamp(mapped, canonicalHeaders);
-
-            // Latest timestamp wins. If timestamps are missing or exactly equal,
-            // the newly uploaded row wins so the newest file remains authoritative.
-            if (incomingTime >= existingTime) {
-              mergedMap.set(id, mapped);
-              if (isIncoming) updatedCount++;
-            }
-          };
-
-          // Always seed the previous snapshot, then layer the newly uploaded
-          // file on top of it.
-          previousRows.forEach(row => putLatest(row, previousHeaders, false));
-          newRows.forEach(row => putLatest(row, headers, true));
-
-          const mergedRows = [...mergedMap.values()];
-          const fileMeta = [
-            ...(Array.isArray(previousRecord?.files) ? previousRecord.files : []),
-            { name: file.name, lastModified: file.lastModified || 0, text }
-          ].filter((item, index, arr) =>
-            arr.findIndex(x =>
-              x.name === item.name &&
-              (x.lastModified || 0) === (item.lastModified || 0)
-            ) === index
-          );
-
-          // Preserve the existing status partition used by all calculations.
           const lmStatuses = new Set(['LMHub_Received', 'Delivered', 'Delivering', 'OnHold']);
           const incomingStatuses = new Set(['SOC_LHTransported', 'SOC_LHTransporting', 'SOC_Packed', 'SOC_Packing']);
-          const mergedStatusIdx = canonIndex.get('status');
-          const lmRows = [], incomingRows = [];
-          let otherCount = 0;
-          mergedRows.forEach(row => {
-            const st = String(row[mergedStatusIdx] ?? '').trim();
-            if (lmStatuses.has(st)) lmRows.push(row);
-            else if (incomingStatuses.has(st)) incomingRows.push(row);
-            else otherCount++;
+          const statusIndex = canonIndex.get('status');
+
+          const classifyRows = (rows, rowHeaders) => {
+            const lm = [], incoming = [], other = [];
+            (Array.isArray(rows) ? rows : []).forEach(row => {
+              const mapped = toCanonical(row, rowHeaders);
+              const id = String(mapped[orderIndex] ?? '').trim();
+              if (!id) return;
+              const status = statusIndex >= 0 ? String(mapped[statusIndex] ?? '').trim() : '';
+              if (lmStatuses.has(status)) lm.push(mapped);
+              else if (incomingStatuses.has(status)) incoming.push(mapped);
+              else other.push(mapped);
+            });
+            return { lm, incoming, other };
+          };
+
+          // De-duplicate by Order ID inside each partition.
+          const uniqueByOrderId = (rows) => {
+            const map = new Map();
+            (Array.isArray(rows) ? rows : []).forEach(row => {
+              const id = String(row?.[orderIndex] ?? '').trim();
+              if (id) map.set(id, row);
+            });
+            return [...map.values()];
+          };
+
+          const uploaded = classifyRows(newRows, headers);
+          const hasLMUpload = uploaded.lm.length > 0;
+          const hasIncomingUpload = uploaded.incoming.length > 0;
+
+          // Previous unified state is used only to preserve the partition that
+          // the current upload does not contain.
+          const previousDataset = previousRecord?.dataset || {};
+          const previousHeaders = Array.isArray(previousDataset.headers)
+            ? previousDataset.headers
+            : canonicalHeaders;
+
+          const previousLM = Array.isArray(previousDataset.lmRows)
+            ? previousDataset.lmRows
+            : (Array.isArray(NOL3.lmInventory?.rows) ? NOL3.lmInventory.rows : []);
+
+          const previousIncoming = Array.isArray(previousDataset.incomingRows)
+            ? previousDataset.incomingRows
+            : (Array.isArray(NOL3.incomingInventory?.rows) ? NOL3.incomingInventory.rows : []);
+
+          const previousLMCanonical = uniqueByOrderId(previousLM.map(row => toCanonical(row, previousHeaders)));
+          const previousIncomingCanonical = uniqueByOrderId(previousIncoming.map(row => toCanonical(row, previousHeaders)));
+
+          // STACKING RULE:
+          // Each upload is added to the existing partition instead of replacing it.
+          // LM upload      -> previous LM + new LM
+          // Incoming upload -> previous Incoming + new Incoming
+          // If the same Order ID appears again, the newest uploaded row wins.
+          // The opposite partition is always preserved.
+          const stackRows = (existingRows, uploadedRows) => {
+            const map = new Map();
+            for (const row of uniqueByOrderId(existingRows || [])) {
+              const id = String(row?.[orderIndex] ?? '').trim();
+              if (id) map.set(id, row);
+            }
+            for (const row of uniqueByOrderId(uploadedRows || [])) {
+              const id = String(row?.[orderIndex] ?? '').trim();
+              if (id) map.set(id, row);
+            }
+            return [...map.values()];
+          };
+
+          const lmRows = hasLMUpload
+            ? stackRows(previousLMCanonical, uploaded.lm)
+            : previousLMCanonical;
+
+          const incomingRows = hasIncomingUpload
+            ? stackRows(previousIncomingCanonical, uploaded.incoming)
+            : previousIncomingCanonical;
+
+          // Keep unknown statuses from the new upload without allowing them to
+          // erase either recognized operational partition.
+          const otherRows = uploaded.other;
+          const otherCount = otherRows.length;
+          const mergedRows = [...lmRows, ...incomingRows, ...otherRows];
+
+          const addedCount = newRows.length;
+          const updatedCount = 0;
+
+          // Keep file metadata for the active unified snapshot. The metadata is
+          // separate from the actual LM/Incoming partitions so preserving one
+          // partition does not accidentally discard its file history.
+          const previousFiles = Array.isArray(previousRecord?.files) ? previousRecord.files : [];
+          const currentFileMeta = {
+            name: file.name,
+            lastModified: file.lastModified || 0,
+            text
+          };
+          const fileMeta = [
+            ...previousFiles,
+            currentFileMeta
+          ].filter((item, index, arr) => {
+            return arr.findIndex(x =>
+              x?.name === item?.name &&
+              (x?.lastModified || 0) === (item?.lastModified || 0)
+            ) === index;
           });
 
           const savedAt = new Date().toISOString();
@@ -8378,12 +8423,58 @@ NOL3.pages.riders = function (root) {
 })();
 
 
+
+/* NOL3 File Store fallback
+ * Android content:// / downloaded HTML files can expose IndexedDB.open() but
+ * fail internally when opening the backing store. The dashboard therefore
+ * uses a memory-backed file store for operational uploads. Supabase remains
+ * the durable cross-device store through NOL3CloudSync.
+ */
+(function () {
+  const records = new Map();
+  const histories = new Map();
+
+  function clone(value) {
+    if (value == null) return value;
+    try { return JSON.parse(JSON.stringify(value)); }
+    catch (_) { return value; }
+  }
+
+  window.NOL3FileStore = {
+    getAll() {
+      return Array.from(records.values()).map(clone);
+    },
+    get(type) {
+      return clone(records.get(String(type)) || null);
+    },
+    put(record) {
+      if (record && record.type) records.set(String(record.type), clone(record));
+    },
+    remove(type) {
+      records.delete(String(type));
+    },
+    putHistory(record) {
+      if (record && record.businessDate) histories.set(String(record.businessDate), clone(record));
+    },
+    getHistory(date) {
+      return clone(histories.get(String(date || '').trim()) || null);
+    },
+    removeHistory(date) {
+      histories.delete(String(date || '').trim());
+    },
+    getHistories() {
+      return Array.from(histories.values()).map(clone);
+    }
+  };
+})();
+
+
 (function () {
   // NOL3 Save Data: export a portable backup of the current browser-local data.
   // Includes localStorage plus all records in the uploaded-file IndexedDB store.
   // This is intentionally local-only until the cloud backend is connected.
   const DB_NAME = "NOL3_Planning_Dashboard_DB_BADOC";
-  const DB_VERSION = 3;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
   const LM_HISTORY_STORE = "lmHistory";
 
@@ -8690,87 +8781,35 @@ NOL3.pages.riders = function (root) {
 
 (function () {
   const DB_NAME = "NOL3_Planning_Dashboard_DB_BADOC";
-  const DB_VERSION = 3;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
   const LM_HISTORY_STORE = "lmHistory";
   const TYPES = ["lm", "incoming", "linehaul"];
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      if (!window.indexedDB) {
-        reject(new Error("IndexedDB is not supported in this browser."));
-        return;
-      }
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(STORE)) {
-          db.createObjectStore(STORE, { keyPath: "type" });
-        }
-        if (!db.objectStoreNames.contains(LM_HISTORY_STORE)) {
-          db.createObjectStore(LM_HISTORY_STORE, { keyPath: "businessDate" });
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
-    });
-  }
+  // IndexedDB is intentionally not used here. The app is frequently opened
+  // directly from Android's content://downloads origin, where IndexedDB can
+  // fail with "Internal error opening backing store". The cloud layer provides
+  // durable persistence across devices.
+  const put = async (record) => {
+    if (window.NOL3FileStore) NOL3FileStore.put(record);
+  };
+  const get = async (type) => window.NOL3FileStore ? NOL3FileStore.get(type) : null;
 
-  function put(record) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put(record);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not save uploaded data.")); };
-    }));
-  }
-
-  function get(type) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const request = tx.objectStore(STORE).get(type);
-      request.onsuccess = () => { const value = request.result; db.close(); resolve(value || null); };
-      request.onerror = () => { db.close(); reject(request.error || new Error("Could not load saved data.")); };
-    }));
-  }
-
-  // Expose storage primitives to the unified-upload module; underlying behavior is unchanged.
   NOL3._storagePut = put;
   NOL3._storageGet = get;
 
-  // LM snapshots are stored by the Philippines calendar upload date.
-  // This keeps today's upload separate from yesterday's instead of letting
-  // the newest upload overwrite the previous day's dataset.
   const LM_HISTORY_PREFIX = "lmHistory::";
   const getLMHistoryKey = (date) => `${LM_HISTORY_PREFIX}${String(date || "").trim()}`;
-
   NOL3.getLMHistoryKey = getLMHistoryKey;
 
   async function putLMHistory(record) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(LM_HISTORY_STORE, "readwrite");
-      tx.objectStore(LM_HISTORY_STORE).put(record);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not save LM history.")); };
-    }));
+    if (window.NOL3FileStore) NOL3FileStore.putHistory(record);
   }
-
   async function getLMHistoryRecord(businessDate) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(LM_HISTORY_STORE, "readonly");
-      const request = tx.objectStore(LM_HISTORY_STORE).get(String(businessDate || "").trim());
-      request.onsuccess = () => { const value = request.result; db.close(); resolve(value || null); };
-      request.onerror = () => { db.close(); reject(request.error || new Error("Could not load LM history.")); };
-    }));
+    return window.NOL3FileStore ? NOL3FileStore.getHistory(businessDate) : null;
   }
-
   async function removeLMHistory(businessDate) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(LM_HISTORY_STORE, "readwrite");
-      tx.objectStore(LM_HISTORY_STORE).delete(String(businessDate || "").trim());
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not clear LM history.")); };
-    }));
+    if (window.NOL3FileStore) NOL3FileStore.removeHistory(businessDate);
   }
 
   NOL3.saveLMHistorySnapshot = async function (businessDate, dataset, files) {
@@ -8803,26 +8842,19 @@ NOL3.pages.riders = function (root) {
   };
 
   function remove(type) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).delete(type);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not clear saved data.")); };
-    }));
+    return Promise.resolve().then(() => {
+      if (window.NOL3FileStore) NOL3FileStore.remove(type);
+    });
   }
 
   NOL3.clearUploadedData = async function (type) {
     if (!TYPES.includes(type)) return;
     if (type === "lm") {
-      // Clear only the snapshot for the selected Business Date. Other dates
-      // remain intact so yesterday's upload cannot be erased by clearing today.
       try {
         const selectedDate = typeof NOL3.getBusinessDateValue === "function"
           ? NOL3.getBusinessDateValue()
           : String(NOL3.currentBusinessDate || "").trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) {
-          await removeLMHistory(selectedDate);
-        }
+        if (/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) await removeLMHistory(selectedDate);
       } catch (error) {
         console.warn("NOL3: Could not clear date-specific LM history.", error);
       }
@@ -9586,7 +9618,7 @@ NOL3.pages.riders = function (root) {
   const HUB_NAME = "Badoc Hub";
   const HUB_CODE = "BADOC";
   const DB_NAME = "NOL3_Planning_Dashboard_DB_BADOC";
-  const DB_VERSION = 3;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
 
   // Three independent sync "channels", all sharing the same hub_data table
@@ -9715,39 +9747,14 @@ NOL3.pages.riders = function (root) {
     return text ? JSON.parse(text) : null;
   };
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      if (!window.indexedDB) return resolve(null);
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
-    });
-  }
-
   function readIndexedDB() {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      if (!db) return resolve([]);
-      if (!db.objectStoreNames.contains(STORE)) { db.close(); return resolve([]); }
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).getAll();
-      req.onsuccess = () => {
-        const records = Array.isArray(req.result) ? req.result : [];
-        db.close();
-        resolve(records);
-      };
-      req.onerror = () => { db.close(); reject(req.error || new Error("Could not read IndexedDB.")); };
-    }));
+    return Promise.resolve(window.NOL3FileStore ? NOL3FileStore.getAll() : []);
   }
 
   function putIndexedDB(record) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      if (!db) return resolve();
-      if (!db.objectStoreNames.contains(STORE)) { db.close(); return resolve(); }
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put(record);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not restore IndexedDB.")); };
-    }));
+    return Promise.resolve().then(() => {
+      if (window.NOL3FileStore && record && record.type) NOL3FileStore.put(record);
+    });
   }
 
   function parseObject(raw, fallback) {
@@ -9857,8 +9864,43 @@ NOL3.pages.riders = function (root) {
 
   async function restoreIndexedDB(records) {
     if (!Array.isArray(records)) return;
+    const restoredTypes = new Set();
     for (const record of records) {
-      if (record && record.type) await putIndexedDB(record);
+      if (record && record.type) {
+        await putIndexedDB(record);
+        restoredTypes.add(record.type);
+      }
+    }
+    if (restoredTypes.has("riders")) {
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", data: NOL3FileStore.get("riders") } }));
+    }
+    if (restoredTypes.has("unifiedInventory")) {
+      const rec = NOL3FileStore.get("unifiedInventory");
+      if (rec?.dataset) {
+        NOL3.lmInventory = {
+          files: rec.files || [],
+          fileName: rec.dataset.fileName || "",
+          headers: rec.dataset.headers || [],
+          rows: rec.dataset.lmRows || [],
+          filteredRows: [],
+          loadedAt: rec.dataset.loadedAt || "",
+          rowCount: Array.isArray(rec.dataset.lmRows) ? rec.dataset.lmRows.length : 0
+        };
+        NOL3.incomingInventory = {
+          files: rec.files || [],
+          fileName: rec.dataset.fileName || "",
+          headers: rec.dataset.headers || [],
+          rows: rec.dataset.incomingRows || [],
+          filteredRows: [],
+          rawText: rec.dataset.rawText || "",
+          loadedAt: rec.dataset.loadedAt || "",
+          rowCount: Array.isArray(rec.dataset.incomingRows) ? rec.dataset.incomingRows.length : 0
+        };
+        try { if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory); } catch (_) {}
+        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", data: NOL3.lmInventory } }));
+        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", data: NOL3.incomingInventory } }));
+        window.dispatchEvent(new CustomEvent("unifiedinventoryloaded", { detail: { fileName: rec.dataset.fileName || "", rowCount: Array.isArray(rec.dataset.rows) ? rec.dataset.rows.length : 0 } }));
+      }
     }
   }
 
@@ -9936,7 +9978,11 @@ NOL3.pages.riders = function (root) {
       const message = String(failures[0].reason?.message || failures[0].reason || "");
       status(/^(400|401|403):/.test(message) ? "KEY REJECTED BY SUPABASE • CHECK KEY" : "ERROR • CHECK SUPABASE", false);
     }
-    if (anyReloaded) setTimeout(() => location.reload(), 250);
+    if (anyReloaded) {
+      try {
+        if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+      } catch (_) {}
+    }
   }
 
   async function ensureChannelInitialized(channel) {
@@ -9993,7 +10039,11 @@ NOL3.pages.riders = function (root) {
       const a = await syncChannelOnce(settingsChannel);
       const b = await syncChannelOnce(rosterChannel);
       status(a || b ? "SYNCED • CLOUD UPDATE" : "CONNECTED • LIVE", true);
-      if (a || b) setTimeout(() => location.reload(), 250);
+      if (a || b) {
+        try {
+          if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        } catch (_) {}
+      }
     } catch (error) {
       console.error("NOL3 cloud sync failed:", error);
       status("OFFLINE • RETRYING", false);
@@ -10003,7 +10053,11 @@ NOL3.pages.riders = function (root) {
   async function syncFiles() {
     try {
       const reload = await syncChannelOnce(filesChannel);
-      if (reload) setTimeout(() => location.reload(), 250);
+      if (reload) {
+        try {
+          if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        } catch (_) {}
+      }
     } catch (error) {
       console.error("NOL3 cloud file sync failed:", error);
     }
