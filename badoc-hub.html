@@ -8679,15 +8679,28 @@ NOL3.pages.riders = function (root) {
   // Rider roster, town arrangements, zone settings, planning exceptions, and other hub settings are preserved.
   const clearAllUploadedFiles = async () => {
     const clearBtn = document.getElementById("clearDataBtn");
-    if (clearBtn) { clearBtn.disabled = true; clearBtn.textContent = "CLEARING..."; }
+    if (clearBtn) {
+      clearBtn.disabled = true;
+      clearBtn.textContent = "CLEARING...";
+    }
+
     try {
+      // Clear every operational upload source, including the persistent
+      // unified-inventory/undo records that could otherwise resurrect data
+      // after a refresh.
       const clearTypes = ["lm", "incoming", "linehaul"];
       for (const type of clearTypes) {
         try { await NOL3.clearUploadedData(type); } catch (_) {}
       }
+
+      try { if (NOL3._storageRemove) await NOL3._storageRemove("unifiedInventory"); } catch (_) {}
+      try { if (NOL3._storageRemove) await NOL3._storageRemove("unifiedInventoryUndo"); } catch (_) {}
+      try { if (NOL3._inventoryUndoMemory) NOL3._inventoryUndoMemory = null; } catch (_) {}
+
       NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
       NOL3.incomingInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
       NOL3.lineHaulInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+
       try { window.dispatchEvent(new CustomEvent("inventorycleared", { detail: { type: "all", source: "manual" } })); } catch (_) {}
       try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
       try { if (typeof renderDeliveryAreas === "function") renderDeliveryAreas(); } catch (_) {}
@@ -8695,14 +8708,36 @@ NOL3.pages.riders = function (root) {
       try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
       try { if (typeof renderPlanning === "function") renderPlanning(); } catch (_) {}
 
-      // Explicitly allow the cloud files channel to write the intentional empty state.
+      // Make the intentional empty files snapshot authoritative in Supabase.
+      // Mark the channel initialized first so a startup/initial-sync read
+      // cannot restore the old cloud snapshot immediately before the clear
+      // is written.
       const filesChannel = window.NOL3CloudSync?.channels?.files;
-      if (filesChannel) filesChannel.allowEmptyPush = true;
-      try { if (window.NOL3CloudSync?.syncNow) await window.NOL3CloudSync.syncNow(); }
-      finally { if (filesChannel) filesChannel.allowEmptyPush = false; }
-      alert("Uploaded files were cleared. Rider data, town arrangements, zone settings, and planning exceptions were kept.");
+      if (filesChannel) {
+        filesChannel.initialized = true;
+        filesChannel.lastHash = "";
+        filesChannel.allowEmptyPush = true;
+      }
+
+      try {
+        if (window.NOL3CloudSync?.syncNow) {
+          await window.NOL3CloudSync.syncNow();
+        }
+      } finally {
+        if (filesChannel) filesChannel.allowEmptyPush = false;
+      }
+
+      alert(
+        "UPLOAD DATA CLEARED\n\n" +
+        "LM Inventory, Incoming Inventory, and Incoming From-To / Linehaul files have been removed.\n\n" +
+        "Your rider data, town arrangements, zone settings, and planning exceptions were NOT changed.\n\n" +
+        "The cleared state has also been saved to the cloud, so refreshing the app will NOT restore the old uploaded files."
+      );
     } finally {
-      if (clearBtn) { clearBtn.disabled = false; clearBtn.textContent = "CLEAR"; }
+      if (clearBtn) {
+        clearBtn.disabled = false;
+        clearBtn.textContent = "CLEAR";
+      }
     }
   };
 
@@ -8712,7 +8747,20 @@ NOL3.pages.riders = function (root) {
     event.preventDefault();
     event.stopPropagation();
     if (button.disabled) return;
-    const confirmed = window.confirm("Clear all uploaded files?\n\nThis will clear LM Inventory, Incoming Inventory, and the Incoming From-To List. Rider data, town arrangements, zone settings, and planning exceptions will NOT be cleared.\n\nContinue?");
+    const confirmed = window.confirm(
+      "CLEAR UPLOADED FILES?\n\n" +
+      "This action will permanently remove the uploaded operational files for Badoc Hub:\n" +
+      "• LM Inventory\n" +
+      "• Incoming Inventory\n" +
+      "• Incoming From-To / Linehaul\n\n" +
+      "It will NOT remove:\n" +
+      "• Rider data\n" +
+      "• Town arrangements\n" +
+      "• Zone settings\n" +
+      "• Planning exceptions\n\n" +
+      "The cleared state will be saved to the cloud and will remain cleared after Refresh.\n\n" +
+      "Are you sure you want to continue?"
+    );
     if (confirmed) clearAllUploadedFiles().catch(error => {
       console.error("NOL3: Could not clear uploaded files.", error);
       alert(`Could not complete Clear: ${error?.message || "unknown error"}`);
