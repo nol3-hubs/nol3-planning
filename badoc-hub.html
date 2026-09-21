@@ -9251,6 +9251,9 @@ NOL3.pages.riders = function (root) {
       window.dispatchEvent(new CustomEvent("inventoryloaded", {
         detail: { type: "incoming", data: result }
       }));
+      // Push the complete Incoming Orders source data immediately. This avoids
+      // relying only on the 5-second polling loop after a large CSV upload.
+      try { if (window.NOL3CloudSync?.syncNow) window.NOL3CloudSync.syncNow(); } catch (_) {}
       console.log("Incoming Inventory loaded:", result.fileName, result.rowCount, "data rows");
     });
   };
@@ -9264,6 +9267,10 @@ NOL3.pages.riders = function (root) {
       NOL3.lineHaulInventory = result;
       NOL3.saveUploadedData("linehaul", [file], result);
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "linehaul", data: result } }));
+      // The Incoming Orders screen requires both datasets: Incoming Inventory
+      // and the Incoming Inventory From-To/Linehaul list. Push immediately so
+      // another device receives the linehaul mapping as well.
+      try { if (window.NOL3CloudSync?.syncNow) window.NOL3CloudSync.syncNow(); } catch (_) {}
       console.log("Line Haul Task ID file loaded:", result.fileName, result.rowCount, "data rows");
     });
   };
@@ -9695,7 +9702,7 @@ NOL3.pages.riders = function (root) {
       const incoming = window.NOL3?.incomingInventory || null;
       const linehaul = window.NOL3?.lineHaulInventory || null;
       return {
-        version: 3,
+        version: 4,
         hubId: HUB_ID,
         hubName: HUB_NAME,
         hubCode: HUB_CODE,
@@ -9803,6 +9810,7 @@ NOL3.pages.riders = function (root) {
 
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", source: "cloud" } }));
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", source: "cloud" } }));
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "linehaul", source: "cloud" } }));
 
       try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
       try { if (typeof renderOnFloorTowns === "function") renderOnFloorTowns(); } catch (_) {}
