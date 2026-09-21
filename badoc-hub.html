@@ -4584,11 +4584,9 @@ NOL3.pages.planning = function (root) {
     NOL3.setBusinessDateNow = async () => {
       const today = getNOL3TodayDate();
 
-      // Commit TODAY first, then restore TODAY's saved LM snapshot before any
-      // metrics/rendering run. Previously the click dispatched the date-change
-      // event before the snapshot was loaded, creating a race on mobile; a
-      // second click happened to make the data appear because the first load
-      // had finished by then.
+      // NOW intentionally uses the same full application refresh as the
+      // REFRESH button. This guarantees every Planning view is rebuilt from
+      // the restored/current snapshot instead of trying to update stale DOM.
       NOL3.currentBusinessDate = today;
       const input = document.getElementById("businessDayDate");
       if (input) input.value = today;
@@ -4599,39 +4597,15 @@ NOL3.pages.planning = function (root) {
           await NOL3.loadLMHistoryForDate(today);
         }
       } catch (error) {
-        console.warn("NOL3: Could not restore today's LM snapshot from NOW.", error);
+        console.warn("NOL3: Could not restore today's LM snapshot from NOW before refresh.", error);
       }
 
-      // The date-change event is asynchronous and is not awaited by dispatchEvent().
-      // Therefore NOW must also rebuild the currently visible page itself after
-      // the dated snapshot has finished loading. Otherwise the old DOM can stay
-      // visible until a full browser Refresh rebuilds it.
-      try {
-        if (typeof NOL3.renderPage === "function") {
-          NOL3.renderPage(NOL3.state?.currentPage || "planning");
-        }
-      } catch (_) {}
-
-      const refreshNowViews = () => {
-        try {
-          if (typeof NOL3.refreshPlanningViews === "function") {
-            NOL3.refreshPlanningViews();
-          } else {
-            renderBusinessDayMetrics();
-          }
-        } catch (_) {}
-      };
-      refreshNowViews();
-      requestAnimationFrame(() => {
-        refreshNowViews();
-        requestAnimationFrame(refreshNowViews);
-        setTimeout(refreshNowViews, 100);
-        setTimeout(refreshNowViews, 500);
-      });
-
-      window.dispatchEvent(new CustomEvent("businessdatechange", {
-        detail: { businessDate: today, source: "now", lmAlreadyLoaded: true }
-      }));
+      // Give the local snapshot write/event loop a moment to settle, then use
+      // the exact same reload path as the REFRESH button. Startup will restore
+      // today's dated snapshot and rebuild the entire Planning DOM.
+      setTimeout(() => {
+        try { window.location.reload(); } catch (_) {}
+      }, 0);
     };
 
     const INCOMING_ARRIVED_STORAGE_KEY = "nol3_incoming_arrived_tasks_v1";
