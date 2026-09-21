@@ -6100,17 +6100,31 @@ NOL3.pages.planning = function (root) {
     };
 
     const rowMatchesPlanningException = (row, headers, exceptionSet) => {
-      if (!row || !exceptionSet?.size) return false;
+      if (!row || !exceptionSet?.size || !Array.isArray(headers)) return false;
 
-      // Search ALL cells in the row. This intentionally does not depend on
-      // the source's column naming because the same order can be represented
-      // by Order ID, SPX TN, SLS TN, Tracking Number, etc.
-      if (Array.isArray(row)) {
-        for (const cell of row) {
-          if (planningExceptionValueMatches(cell, exceptionSet)) return true;
-        }
+      // Exceptions are tracking/order identifiers. Do NOT search every cell in
+      // the row: operational fields such as Delivery Attempts, Total of On Hold
+      // Times, Reschedule Date, etc. can legitimately contain values like "1".
+      // Searching every cell would therefore exclude unrelated orders when an
+      // operator enters a short tracking value such as 1.
+      const normalizedHeaders = headers.map(h => String(h || '').trim().toLowerCase());
+      const identityNames = [
+        'order id', 'orderid', 'order no', 'order number',
+        'sls tracking number', 'sls tn', 'tracking number', 'tracking no',
+        'tracking id', 'spx tracking number', 'spx tn', 'spx tracking no',
+        'shopee order sn'
+      ];
+      const identityIndexes = [];
+      normalizedHeaders.forEach((header, index) => {
+        if (identityNames.includes(header)) identityIndexes.push(index);
+      });
+
+      // If a source has no recognized identifier column, do not fall back to
+      // all cells. That is safer than silently excluding orders because a
+      // numeric operational field happens to equal an exception value.
+      for (const index of identityIndexes) {
+        if (planningExceptionValueMatches(row[index], exceptionSet)) return true;
       }
-
       return false;
     };
     const renderPlanningExceptions = () => {
