@@ -10046,11 +10046,14 @@ NOL3.pages.riders = function (root) {
     const exceptionStore = parseObject(NOL3Storage.get("nol3_planning_exceptions_v1:" + hub), []);
     const overrideStore = parseObject(NOL3Storage.get("nol3_zone_id_overrides_v1"), {});
     const zoneSettingsStore = parseObject(NOL3Storage.get("nol3_zone_settings_v1"), {});
+    const planningByHub = layoutStore?.byHub && typeof layoutStore.byHub === "object"
+      ? layoutStore.byHub
+      : layoutStore;
 
     return {
       businessDate: NOL3Storage.get("nol3_business_day_date_v1") || "",
       businessDaySettings: NOL3Storage.get("nol3_business_day_settings_v1") || "",
-      planningLayout: layoutStore[hub] || null,
+      planningLayout: planningByHub?.[hub] || null,
       fleetProductivity: NOL3Storage.get("nol3_fleet_productivity_v1") || "",
       planningExceptions: exceptionStore,
       zoneOverrides: overrideStore[hub] || {},
@@ -10074,8 +10077,15 @@ NOL3.pages.riders = function (root) {
       }
       if (state.planningLayout && typeof state.planningLayout === "object") {
         const store = parseObject(NOL3Storage.get("nol3_planning_layout_v1"), {});
-        store[HUB_NAME] = state.planningLayout;
-        NOL3Storage.set("nol3_planning_layout_v1", JSON.stringify(store));
+        const byHub = store?.byHub && typeof store.byHub === "object"
+          ? store.byHub
+          : (Array.isArray(store) ? { __NO_HUB__: store } : store);
+        const normalized = {
+          version: 2,
+          byHub: { ...(byHub || {}) }
+        };
+        normalized.byHub[HUB_NAME] = state.planningLayout;
+        NOL3Storage.set("nol3_planning_layout_v1", JSON.stringify(normalized));
       }
       if (state.zoneOverrides && typeof state.zoneOverrides === "object") {
         const store = parseObject(NOL3Storage.get("nol3_zone_id_overrides_v1"), {});
@@ -10348,8 +10358,11 @@ NOL3.pages.riders = function (root) {
         currentHash !== channel.lastHash &&
         allowPush &&
         (snapshotHasData(channel, local) || channel.allowEmptyPush) &&
-        !(channel === filesChannel && channel.lastRemoteClearedByUser)
+        !(channel === filesChannel && channel.lastRemoteClearedByUser && !snapshotHasData(channel, local))
       ) {
+        if (channel === filesChannel && snapshotHasData(channel, local)) {
+          channel.lastRemoteClearedByUser = false;
+        }
         channel.lastLocalMutationAt = Date.now();
         local.clientUpdatedAt = channel.lastLocalMutationAt;
         if (channel === filesChannel) channel.lastRemoteClearedByUser = false;
@@ -10535,13 +10548,15 @@ NOL3.pages.riders = function (root) {
     if (type === "riders") {
       schedulePushCheck(rosterChannel, () => syncSettingsAndRoster(true));
     } else if (type === "lm" || type === "incoming" || type === "linehaul") {
+      // A real upload intentionally supersedes the previous Clear tombstone.
+      filesChannel.lastRemoteClearedByUser = false;
       schedulePushCheck(filesChannel, () => syncFiles(true));
     }
   });
 
   window.addEventListener("inventorycleared", (event) => {
     if (applyingRemote || event?.detail?.source === "cloud") return;
-    schedulePushCheck(filesChannel, syncFiles);
+    schedulePushCheck(filesChannel, () => syncFiles(true));
   });
 })();
 </script>
