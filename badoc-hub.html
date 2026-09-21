@@ -4676,6 +4676,9 @@ NOL3.pages.planning = function (root) {
       const arrived = getArrivedIncomingTasks();
       if (checked) arrived.add(value); else arrived.delete(value);
       saveArrivedIncomingTasks(arrived);
+      window.dispatchEvent(new CustomEvent("planningchanged", {
+        detail: { type: "incoming-arrived", source: "local" }
+      }));
       renderIncomingOrders();
       renderIncomingLinehaulSelector();
 
@@ -9701,6 +9704,7 @@ NOL3.pages.riders = function (root) {
           files: Array.isArray(lm.files) ? lm.files : [],
           headers: Array.isArray(lm.headers) ? lm.headers : [],
           rows: Array.isArray(lm.rows) ? lm.rows : [],
+          filteredRows: Array.isArray(lm.filteredRows) ? lm.filteredRows : [],
           rawText: typeof lm.rawText === "string" ? lm.rawText : "",
           loadedAt: lm.loadedAt || ""
         } : null,
@@ -9711,7 +9715,16 @@ NOL3.pages.riders = function (root) {
           rows: Array.isArray(incoming.rows) ? incoming.rows : [],
           rawText: typeof incoming.rawText === "string" ? incoming.rawText : "",
           loadedAt: incoming.loadedAt || ""
-        } : null
+        } : null,
+        arrivedIncomingTasks: (() => {
+          try {
+            const raw = NOL3Storage.get("nol3_incoming_arrived_tasks_v1");
+            const parsed = JSON.parse(raw || "[]");
+            return Array.isArray(parsed)
+              ? parsed.map(v => String(v || "").trim()).filter(Boolean)
+              : [];
+          } catch (_) { return []; }
+        })()
       };
     },
     async applyRemote(data) {
@@ -9724,12 +9737,16 @@ NOL3.pages.riders = function (root) {
           files: Array.isArray(lm.files) ? lm.files : [],
           headers: Array.isArray(lm.headers) ? lm.headers : [],
           rows: Array.isArray(lm.rows) ? lm.rows : [],
-          filteredRows: [],
+          filteredRows: Array.isArray(lm.filteredRows) ? lm.filteredRows : [],
           loadedAt: lm.loadedAt || new Date().toISOString(),
           rowCount: Array.isArray(lm.rows) ? lm.rows.length : 0,
           rawText: typeof lm.rawText === "string" ? lm.rawText : ""
         };
-        if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory);
+        if (typeof filterLMForHub === "function") {
+          filterLMForHub(NOL3.lmInventory);
+          // Prefer the cloud-derived filtered snapshot when it is present.
+          if (Array.isArray(lm.filteredRows)) NOL3.lmInventory.filteredRows = lm.filteredRows;
+        }
       }
 
       if (data.incomingInventory) {
@@ -9744,6 +9761,18 @@ NOL3.pages.riders = function (root) {
           rowCount: Array.isArray(incoming.rows) ? incoming.rows.length : 0,
           rawText: typeof incoming.rawText === "string" ? incoming.rawText : ""
         };
+      }
+
+      // Confirmed Incoming Linehaul arrivals are part of the Planning
+      // calculation. Restore them together with inventory so Total Volume and
+      // Town counts match across devices.
+      if (Array.isArray(data.arrivedIncomingTasks)) {
+        try {
+          NOL3Storage.set(
+            "nol3_incoming_arrived_tasks_v1",
+            JSON.stringify(data.arrivedIncomingTasks)
+          );
+        } catch (_) {}
       }
 
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", source: "cloud" } }));
