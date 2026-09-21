@@ -6750,40 +6750,7 @@ NOL3.pages.planning = function (root) {
       }, 0);
     });
 
-    window.addEventListener("businessdatechange", async (event) => {
-      // Business Date selects the active dated LM snapshot. Always restore that
-      // snapshot BEFORE rendering any derived Planning values. The old handler
-      // only refreshed the cards, so switching away from today and back left
-      // lmInventory empty and Total Volume/Town counts stayed at zero.
-      const date = String(event?.detail?.businessDate || (NOL3.getBusinessDateValue && NOL3.getBusinessDateValue()) || "").trim();
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return;
 
-      try {
-        if (!event?.detail?.lmAlreadyLoaded && typeof NOL3.loadLMHistoryForDate === "function") {
-          await NOL3.loadLMHistoryForDate(date);
-        }
-      } catch (error) {
-        console.warn("NOL3: Could not restore LM snapshot for business date.", date, error);
-      }
-
-      // loadLMHistoryForDate dispatches inventoryloaded and rebuilds
-      // filteredRows. Re-render once more after the awaited restore so all
-      // Planning cards and town lists use the restored dataset.
-      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
-      renderOnFloorTowns();
-      renderDeliveryAreas();
-      renderIncomingOrders();
-      updateIncomingOrdersNotification();
-      if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
-
-      // Keep the Fleet Productivity control in sync with the hub-scoped value
-      // after date changes/re-renders. Fleet Productivity is hub-scoped, not
-      // date-scoped, so changing Business Date must never reset it to 50.
-      const fp = document.getElementById('planningFleetProductivity');
-      if (fp && typeof getFleetProductivityTarget === 'function') {
-        fp.value = String(getFleetProductivityTarget());
-      }
-    });
 
     const townToggleBtn = document.getElementById("townToggleBtn");
     const townSummary = document.getElementById("onFloorTownSummary");
@@ -9544,38 +9511,24 @@ NOL3.pages.riders = function (root) {
         await NOL3.loadLMHistoryForDate(date);
       }
 
-      // Rebuild filteredRows from the snapshot that was just loaded. Total
-      // Volume and Town counts are derived from this hub-filtered dataset.
-      const hub = (NOL3.getState && NOL3.getState().selectedHub) || "";
-      const lm = NOL3.lmInventory || {};
-      const rows = Array.isArray(lm.rows) ? lm.rows : [];
-      const headers = Array.isArray(lm.headers) ? lm.headers : [];
-      const normalizedHeaders = headers.map(h => String(h || "").trim().toLowerCase());
-      const stationIndex = normalizedHeaders.indexOf("current station");
-
-      if (!hub) {
-        lm.filteredRows = rows.slice();
-      } else if (stationIndex >= 0) {
-        const target = String(hub).trim().toLowerCase();
-        lm.filteredRows = rows.filter(row =>
-          String(row?.[stationIndex] || "").trim().toLowerCase() === target
-        );
-      } else {
-        lm.filteredRows = [];
-      }
-
+      // loadLMHistoryForDate() already rebuilds filteredRows. Do not repeat
+      // the full row filter here; doing it again on large LM files was a major
+      // source of date-switch lag.
       if (typeof NOL3.updateInventoryUploadSummaries === "function") {
-        await NOL3.updateInventoryUploadSummaries();
+        try { await NOL3.updateInventoryUploadSummaries(); } catch (_) {}
       }
 
-      // Render only after the correct dated dataset is active.
-      const page = NOL3.getState && NOL3.getState().currentPage;
-      if (typeof NOL3.renderTopbar === "function") NOL3.renderTopbar();
-      if (page && typeof NOL3.renderPage === "function") NOL3.renderPage(page);
-      if (typeof NOL3.renderBusinessDayMetrics === "function") {
-        NOL3.renderBusinessDayMetrics();
-        setTimeout(() => NOL3.renderBusinessDayMetrics(), 0);
-      }
+      // Refresh only the views that depend on the dated LM dataset. Avoid a
+      // full renderPage() because rebuilding the entire DOM can be expensive
+      // with large uploads and was unnecessary for a date switch.
+      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+      if (typeof renderOnFloorTowns === "function") renderOnFloorTowns();
+      if (typeof renderDeliveryAreas === "function") renderDeliveryAreas();
+      if (typeof renderIncomingOrders === "function") renderIncomingOrders();
+      if (typeof updateIncomingOrdersNotification === "function") updateIncomingOrdersNotification();
+      if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
+      if (typeof renderUnassignedOrders === "function") renderUnassignedOrders();
+      if (typeof renderParcelRecords === "function") renderParcelRecords();
     } catch (error) {
       console.warn("NOL3: Could not switch LM snapshot for Business Date.", error);
     } finally {
@@ -9590,8 +9543,6 @@ NOL3.pages.riders = function (root) {
   const refresh = () => {
     if (typeof NOL3.renderBusinessDayMetrics !== "function") return;
     NOL3.renderBusinessDayMetrics();
-    setTimeout(() => NOL3.renderBusinessDayMetrics(), 0);
-    setTimeout(() => NOL3.renderBusinessDayMetrics(), 100);
   };
   window.addEventListener("inventoryloaded", event => {
     if (event.detail?.type === "lm") refresh();
