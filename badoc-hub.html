@@ -3448,35 +3448,18 @@ window.NOL3.escapeHTML = function(value) {
           const previousLMCanonical = uniqueByOrderId(previousLM.map(row => toCanonical(row, previousHeaders)));
           const previousIncomingCanonical = uniqueByOrderId(previousIncoming.map(row => toCanonical(row, previousHeaders)));
 
-          // STACKING RULE:
-          // Each upload is added to the existing partition instead of replacing it.
-          // LM upload      -> previous LM + new LM
-          // Incoming upload -> previous Incoming + new Incoming
-          // If the same Order ID appears again, the newest uploaded row wins.
-          // The opposite partition is always preserved.
-          const stackRows = (existingRows, uploadedRows) => {
-            const map = new Map();
-            for (const row of uniqueByOrderId(existingRows || [])) {
-              const id = String(row?.[orderIndex] ?? '').trim();
-              if (id) map.set(id, row);
-            }
-            for (const row of uniqueByOrderId(uploadedRows || [])) {
-              const id = String(row?.[orderIndex] ?? '').trim();
-              if (id) map.set(id, row);
-            }
-            return [...map.values()];
-          };
+          // Incoming-only file: keep LM so Town count and Total Volume do not reset.
+          // LM-only file: keep Incoming so Incoming Orders do not disappear.
+          // Mixed file: use the uploaded partitions as the complete replacement.
+          const lmRows = uniqueByOrderId(
+            hasLMUpload ? uploaded.lm : previousLMCanonical
+          );
+          const incomingRows = uniqueByOrderId(
+            hasIncomingUpload ? uploaded.incoming : previousIncomingCanonical
+          );
 
-          const lmRows = hasLMUpload
-            ? stackRows(previousLMCanonical, uploaded.lm)
-            : previousLMCanonical;
-
-          const incomingRows = hasIncomingUpload
-            ? stackRows(previousIncomingCanonical, uploaded.incoming)
-            : previousIncomingCanonical;
-
-          // Keep unknown statuses from the new upload without allowing them to
-          // erase either recognized operational partition.
+          // Keep unknown statuses from the new upload, but never let them wipe
+          // either recognized operational partition.
           const otherRows = uploaded.other;
           const otherCount = otherRows.length;
           const mergedRows = [...lmRows, ...incomingRows, ...otherRows];
@@ -9673,39 +9656,105 @@ NOL3.pages.riders = function (root) {
     pollMs: 5000,
     debounceMs: 1200,
     async buildSnapshot() {
-      const all = await readIndexedDB();
+      const rider = window.NOL3?.riderData || null;
       return {
-        version: 1,
+        version: 2,
         hubId: HUB_ID,
         hubName: HUB_NAME,
         hubCode: HUB_CODE,
         clientUpdatedAt: rosterChannel.lastLocalMutationAt || Number(localStorage.getItem(rosterChannel.metaKey) || 0),
-        indexedDB: all.filter(record => record && record.type === "riders")
+        riderData: rider ? {
+          fileName: rider.fileName || "",
+          headers: Array.isArray(rider.headers) ? rider.headers : [],
+          rows: Array.isArray(rider.rows) ? rider.rows : [],
+          rawText: typeof rider.rawText === "string" ? rider.rawText : "",
+          loadedAt: rider.loadedAt || ""
+        } : null
       };
     },
     async applyRemote(data) {
-      await restoreIndexedDB(data.indexedDB);
+      if (!data || !data.riderData) return;
+      NOL3.riderData = data.riderData;
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "cloud" } }));
+      if (NOL3.state?.currentPage === "riders" && typeof NOL3.renderPage === "function") {
+        NOL3.renderPage("riders");
+      }
     }
   });
 
   const filesChannel = makeChannel({
     dataType: "app_state_files",
     metaKey: "NOL3_CLOUD_LAST_APPLIED_BADOC_FILES",
-    pollMs: 60000,
-    debounceMs: 8000,
+    pollMs: 5000,
+    debounceMs: 3000,
     async buildSnapshot() {
-      const all = await readIndexedDB();
+      const lm = window.NOL3?.lmInventory || null;
+      const incoming = window.NOL3?.incomingInventory || null;
       return {
-        version: 1,
+        version: 3,
         hubId: HUB_ID,
         hubName: HUB_NAME,
         hubCode: HUB_CODE,
         clientUpdatedAt: filesChannel.lastLocalMutationAt || Number(localStorage.getItem(filesChannel.metaKey) || 0),
-        indexedDB: all.filter(record => !(record && record.type === "riders"))
+        lmInventory: lm ? {
+          fileName: lm.fileName || "",
+          files: Array.isArray(lm.files) ? lm.files : [],
+          headers: Array.isArray(lm.headers) ? lm.headers : [],
+          rows: Array.isArray(lm.rows) ? lm.rows : [],
+          rawText: typeof lm.rawText === "string" ? lm.rawText : "",
+          loadedAt: lm.loadedAt || ""
+        } : null,
+        incomingInventory: incoming ? {
+          fileName: incoming.fileName || "",
+          files: Array.isArray(incoming.files) ? incoming.files : [],
+          headers: Array.isArray(incoming.headers) ? incoming.headers : [],
+          rows: Array.isArray(incoming.rows) ? incoming.rows : [],
+          rawText: typeof incoming.rawText === "string" ? incoming.rawText : "",
+          loadedAt: incoming.loadedAt || ""
+        } : null
       };
     },
     async applyRemote(data) {
-      await restoreIndexedDB(data.indexedDB);
+      if (!data) return;
+
+      if (data.lmInventory) {
+        const lm = data.lmInventory;
+        NOL3.lmInventory = {
+          fileName: lm.fileName || "",
+          files: Array.isArray(lm.files) ? lm.files : [],
+          headers: Array.isArray(lm.headers) ? lm.headers : [],
+          rows: Array.isArray(lm.rows) ? lm.rows : [],
+          filteredRows: [],
+          loadedAt: lm.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(lm.rows) ? lm.rows.length : 0,
+          rawText: typeof lm.rawText === "string" ? lm.rawText : ""
+        };
+        if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory);
+      }
+
+      if (data.incomingInventory) {
+        const incoming = data.incomingInventory;
+        NOL3.incomingInventory = {
+          fileName: incoming.fileName || "",
+          files: Array.isArray(incoming.files) ? incoming.files : [],
+          headers: Array.isArray(incoming.headers) ? incoming.headers : [],
+          rows: Array.isArray(incoming.rows) ? incoming.rows : [],
+          filteredRows: [],
+          loadedAt: incoming.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(incoming.rows) ? incoming.rows.length : 0,
+          rawText: typeof incoming.rawText === "string" ? incoming.rawText : ""
+        };
+      }
+
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", source: "cloud" } }));
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", source: "cloud" } }));
+
+      try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
+      try { if (typeof renderOnFloorTowns === "function") renderOnFloorTowns(); } catch (_) {}
+      try { if (typeof renderDeliveryAreas === "function") renderDeliveryAreas(); } catch (_) {}
+      try { if (typeof renderIncomingOrders === "function") renderIncomingOrders(); } catch (_) {}
+      try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
+      try { if (typeof renderParcelRecords === "function") renderParcelRecords(); } catch (_) {}
     }
   });
 
@@ -10116,10 +10165,12 @@ NOL3.pages.riders = function (root) {
   window.addEventListener("planningchanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
   window.addEventListener("zonechanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
   window.addEventListener("inventoryloaded", (event) => {
+    if (event.detail?.source === "cloud") return;
     if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
     else schedulePushCheck(filesChannel, syncFiles);
   });
   window.addEventListener("inventorycleared", (event) => {
+    if (event.detail?.source === "cloud") return;
     if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
     else schedulePushCheck(filesChannel, syncFiles);
   });
