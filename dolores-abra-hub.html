@@ -751,6 +751,11 @@ th{color:#667085;font-weight:650}
 .incoming-town-count-value{font-weight:800;color:#344054}
 .incoming-empty{padding:22px;text-align:center;color:#667085;font-size:13px}
 @media(max-width:700px){.incoming-town-counts{grid-template-columns:1fr}}
+.incoming-arrived-wrap{display:inline-flex;align-items:center;gap:6px;margin-left:8px;white-space:nowrap;font-size:11px;font-weight:800;color:#344054;cursor:pointer}
+.incoming-arrived-checkbox{width:16px;height:16px;accent-color:#16a34a;cursor:pointer}
+.incoming-linehaul-card.arrived{border-color:#86efac;background:#f0fdf4}
+.incoming-linehaul-card.arrived .incoming-linehaul-title{color:#166534}
+.incoming-arrived-label{font-size:10px;font-weight:900;text-transform:uppercase;letter-spacing:.3px;color:#15803d}
 
 /* Riders data workspace */
 .riders-page{
@@ -2236,6 +2241,13 @@ th{color:#667085;font-weight:650}
 .zone-id-rebuilt-empty{padding:12px 10px!important;color:#667085!important;font-size:13px!important;}
 </style>
 
+
+    <style id="hide-business-day-metric-cards">
+      /* Hidden from the UI; metric calculation logic remains intact for other features. */
+      #businessDayMetrics {
+        display: none !important;
+      }
+    </style>
 </head>
 <body>
 <div class="app-shell">
@@ -2315,6 +2327,29 @@ window.NOL3Storage = (() => {
 </script>
 
 <script>
+// Always resolve the upload calendar date in Philippine time, regardless of
+// the browser/device timezone. This date is the key used for daily LM history.
+function getNOL3TodayDate() {
+  try {
+    const parts = new Intl.DateTimeFormat("en-CA", {
+      timeZone: "Asia/Manila",
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }).formatToParts(new Date());
+    const values = {};
+    for (const part of parts) {
+      if (part.type !== "literal") values[part.type] = part.value;
+    }
+    if (values.year && values.month && values.day) {
+      return `${values.year}-${values.month}-${values.day}`;
+    }
+  } catch (_) {}
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+window.getNOL3TodayDate = getNOL3TodayDate;
+
 window.NOL3InitialBusinessDate = (() => {
   try {
     const saved = String(localStorage.getItem("nol3_business_day_date_v1") || "").trim();
@@ -2346,20 +2381,26 @@ window.NOL3.escapeHTML = function(value) {
 };
 
 
+// This copy of the dashboard is permanently locked to one hub. Seeding
+// selectedHub/hubs from this hardcoded constant — instead of from
+// localStorage — closes a real cross-hub data leak: all 26 hub files are
+// hosted on the same origin and therefore share the same localStorage, so
+// reading "last selected hub" from storage here could return whichever hub
+// was last opened in ANY of the 26 files on this browser, not necessarily
+// this one. Every hub-scoped read (Planning layout, zone settings, business
+// day settings, etc.) depends on this value being correct from the very
+// first line of script execution, not after some later async correction.
+const NOL3_FIXED_HUB_NAME = "Dolores-Abra Hub";
+
 (function () {
   const HUBS_KEY = "nol3_hubs";
   const SELECTED_HUB_KEY = "nol3_selected_hub";
 
-  let hubs = JSON.parse(NOL3Storage.get(HUBS_KEY) || "[]")
-    .filter(hub => hub !== "Main Hub");
-
+  let hubs = [NOL3_FIXED_HUB_NAME];
   NOL3Storage.set(HUBS_KEY, JSON.stringify(hubs));
 
-  let selectedHub = NOL3Storage.get(SELECTED_HUB_KEY) || "";
-  if (selectedHub === "Main Hub") {
-    selectedHub = "";
-    NOL3Storage.remove(SELECTED_HUB_KEY);
-  }
+  let selectedHub = NOL3_FIXED_HUB_NAME;
+  NOL3Storage.set(SELECTED_HUB_KEY, selectedHub);
 
   NOL3.state = {
     hubs,
@@ -2523,7 +2564,7 @@ window.NOL3.escapeHTML = function(value) {
               <strong>Click to upload CSV file</strong>
               <div class="file-summary" id="unifiedInventorySummary">No file selected</div>
             </label>
-            <button class="inventory-clear-btn" id="clearUnifiedInventoryBtn" type="button" disabled>Undo Last Upload</button>
+            <button class="inventory-clear-btn" id="clearUnifiedInventoryBtn" type="button" disabled onclick="window.NOL3_undoUnifiedInventory(event)">Undo Last Upload</button>
             <div class="lm-filter-status" id="unifiedInventoryStatus">No inventory loaded</div>
           </section>
 
@@ -2687,65 +2728,210 @@ window.NOL3.escapeHTML = function(value) {
       lmInput.value = "";
     });
 
-    lmInput.addEventListener("change", () => {
+    const isForwardOrderFile = (file) =>
+      /(^|[_\-\s])forward([_\-\s]|order)|export_forward_order/i.test(String(file?.name || ""));
+
+    // Files such as TRANS exports use the same LM column layout, but they are
+    // not LM snapshots. Never let one of these files replace the active LM
+    // snapshot and make the Badoc volume disappear.
+    const isNonLMSupportFile = (file) =>
+      /(^|[_\-\s])trans([._\-\s]|$)|export_trans/i.test(String(file?.name || ""));
+
+    lmInput.addEventListener("change", async () => {
       showLMFiles();
 
       const files = Array.from(lmInput.files || []);
       if (!files.length) return;
+      if (clearLMBtn) clearLMBtn.disabled = false;
 
-      if (files.length === 1) {
-        if (clearLMBtn) clearLMBtn.disabled = false;
-        NOL3.readLMInventoryFile(files[0]);
-        return;
+      // Read every selected file first. This is important when a full LM
+      // snapshot and a Forward Order update are selected together: the full
+      // snapshot must be the base, and the Forward Order file must be merged
+      // on top of it. The previous implementation could treat the batch as
+      // an incremental upload with an empty base and leave only the update.
+      const parsedFiles = [];
+      const ignoredFiles = [];
+      for (const file of files) {
+        if (isNonLMSupportFile(file)) {
+          ignoredFiles.push(file.name);
+          continue;
+        }
+        try {
+          const result = await new Promise((resolve) => {
+            NOL3.readCSVFile(file, resolve);
+          });
+          const parsed = parseCSVRows(result.rawText);
+          if (!parsed.length) continue;
+          const headers = parsed[0].map(value => value.trim());
+          const rows = parsed.slice(1).filter(row => row.some(value => String(value || "").trim() !== ""));
+          parsedFiles.push({ file, headers, rows, isForward: isForwardOrderFile(file) });
+        } catch (error) {
+          console.warn("NOL3: Could not parse LM file", file?.name, error);
+        }
+      }
+      if (ignoredFiles.length) {
+        console.info("NOL3: Ignored non-LM support file(s):", ignoredFiles);
+        const summary = document.getElementById("lmSummary");
+        if (summary) summary.textContent = ignoredFiles.length === 1
+          ? `${ignoredFiles[0]} ignored (not an LM snapshot)`
+          : `${ignoredFiles.length} non-LM files ignored`;
+      }
+      if (!parsedFiles.length) return;
+
+      // Capture the complete pre-upload state before changing LM data.
+      try {
+        const uploadDateForUndo = (typeof getNOL3TodayDate === "function") ? getNOL3TodayDate() : new Date().toISOString().slice(0, 10);
+        const previousLMRecord = await NOL3._storageGet('lm');
+        const previousUnifiedRecord = await NOL3._storageGet('unifiedInventory');
+        const previousLMHistory = typeof NOL3.getLMHistorySnapshot === 'function' ? await NOL3.getLMHistorySnapshot(uploadDateForUndo) : null;
+        NOL3._inventoryUndoMemory = { snapshot: previousUnifiedRecord || null, lmRecord: previousLMRecord || null, lmHistory: previousLMHistory || null, uploadDate: uploadDateForUndo, savedAt: new Date().toISOString() };
+        await NOL3._storagePut({ type: 'unifiedInventoryUndo', snapshot: previousUnifiedRecord || null, lmRecord: previousLMRecord || null, lmHistory: previousLMHistory || null, uploadDate: uploadDateForUndo, savedAt: new Date().toISOString() });
+      } catch (e) {
+        console.warn('NOL3: Could not save LM undo point to storage; live-memory undo remains available.', e);
       }
 
-      // Multiple LM files are merged into one filtered dataset.
-      let pending = files.length;
-      const merged = [];
-      let mergedHeaders = null;
+      const fullSnapshots = parsedFiles.filter(item => !item.isForward);
+      const forwardUpdates = parsedFiles.filter(item => item.isForward);
 
-      files.forEach((file) => {
-        NOL3.readCSVFile(file, (result) => {
-          const parsed = parseCSVRows(result.rawText);
-          if (parsed.length) {
-            const headers = parsed[0].map(value => value.trim());
-            if (!mergedHeaders) mergedHeaders = headers;
-            merged.push(...parsed.slice(1).filter(row => row.some(value => String(value || "").trim() !== "")));
-          }
+      /*
+       * STACKING RULE:
+       * Every new LM upload is merged into the currently active LM snapshot.
+       * A normal LM snapshot does NOT replace the previous upload.
+       *
+       * File 1 -> File 1
+       * File 2 -> File 1 + File 2
+       * File 3 -> File 1 + File 2 + File 3
+       * Same Order ID -> newest uploaded record replaces the older record
+       *
+       * Forward Order files are also incremental and are layered after the
+       * normal uploads in the same batch.
+       */
+      /*
+       * IMPORTANT: The source of truth for stacking is TODAY'S SAVED LM
+       * SNAPSHOT, not whatever Business Date happens to be displayed.
+       *
+       * The previous fix only used the saved snapshot when the in-memory
+       * dataset was empty. If the user was viewing an older Business Date,
+       * that older/empty dataset became the base and the new upload appeared
+       * to replace the previous upload.
+       *
+       * Every upload therefore starts from today's persisted snapshot.
+       * If today's snapshot does not exist yet, use the active in-memory
+       * dataset as the first-upload fallback.
+       */
+      let baseInventory = { headers: [], rows: [], files: [] };
 
-          pending -= 1;
+      if (typeof getNOL3TodayDate === "function" &&
+          typeof NOL3.getLMHistorySnapshot === "function") {
+        try {
+          const uploadDate = getNOL3TodayDate();
+          const savedLM = await NOL3.getLMHistorySnapshot(uploadDate);
 
-          if (pending === 0) {
-            const mergedResult = mergeLMInventoryRows(NOL3.lmInventory, mergedHeaders || [], merged);
-            const previousFiles = Array.isArray(NOL3.lmInventory?.files) ? NOL3.lmInventory.files : [];
-            const allFiles = [...previousFiles, ...files].filter((item, index, arr) =>
-              arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
-            );
-            NOL3.lmInventory = {
-              files: allFiles,
-              fileName: allFiles.map(f => f.name).join(', '),
-              headers: mergedResult.headers,
-              rows: mergedResult.rows,
-              filteredRows: [],
-              loadedAt: new Date().toISOString()
+          if (savedLM?.dataset && Array.isArray(savedLM.dataset.rows)) {
+            baseInventory = {
+              headers: Array.isArray(savedLM.dataset.headers) ? savedLM.dataset.headers : [],
+              rows: savedLM.dataset.rows,
+              files: Array.isArray(savedLM.files) ? savedLM.files : []
             };
-
-            saveCurrentLMData(files);
-            updateLMFilterStatus();
-
-            window.dispatchEvent(new CustomEvent("inventoryloaded", {
-              detail: {
-                type: "lm",
-                fileName: NOL3.lmInventory.fileName,
-                totalRows: merged.length,
-                headers: NOL3.lmInventory.headers
-              }
-            }));
-
-            console.log("LM Inventory files loaded:", files.length, `${merged.length} data rows`);
+          } else if (NOL3.lmInventory && Array.isArray(NOL3.lmInventory.rows) &&
+                     NOL3.lmInventory.rows.length) {
+            baseInventory = {
+              headers: Array.isArray(NOL3.lmInventory.headers) ? NOL3.lmInventory.headers : [],
+              rows: NOL3.lmInventory.rows,
+              files: Array.isArray(NOL3.lmInventory.files) ? NOL3.lmInventory.files : []
+            };
           }
-        });
-      });
+        } catch (error) {
+          console.warn("NOL3: Could not load today's saved LM snapshot before stacking.", error);
+          if (NOL3.lmInventory && Array.isArray(NOL3.lmInventory.rows)) {
+            baseInventory = NOL3.lmInventory;
+          }
+        }
+      } else if (NOL3.lmInventory && Array.isArray(NOL3.lmInventory.rows)) {
+        baseInventory = NOL3.lmInventory;
+      }
+
+      // Merge every selected full snapshot on top of today's persisted dataset.
+      // Do NOT reset baseInventory to an empty object here.
+      for (const item of fullSnapshots) {
+        baseInventory = mergeLMInventoryRows(
+          baseInventory,
+          item.headers,
+          item.rows
+        );
+      }
+
+      // Forward Order rows are always applied last.
+      for (const item of forwardUpdates) {
+        baseInventory = mergeLMInventoryRows(
+          baseInventory,
+          item.headers,
+          item.rows
+        );
+      }
+
+      const selectedFiles = parsedFiles.map(item => item.file);
+      const baseFiles = fullSnapshots.length
+        ? fullSnapshots.map(item => item.file)
+        : (Array.isArray(baseInventory.files) ? baseInventory.files : []);
+      const allFiles = [...baseFiles, ...selectedFiles].filter((item, index, arr) =>
+        arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
+      );
+
+      NOL3.lmInventory = {
+        files: allFiles,
+        fileName: allFiles.map(f => f.name).join(', '),
+        headers: baseInventory.headers,
+        rows: baseInventory.rows,
+        filteredRows: [],
+        loadedAt: new Date().toISOString()
+      };
+
+      // Any upload changes the active snapshot, so discard the cached volume
+      // for the selected hub/business date and recalculate from the new data.
+      try {
+        const hubForFreeze = getSelectedHub() || "__default__";
+        const businessDateForFreeze = getBusinessDateValue();
+        const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
+        delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+        NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
+      } catch (_) {}
+
+      await saveCurrentLMData(allFiles);
+      if (typeof NOL3._refreshUnifiedUndoButton === "function") await NOL3._refreshUnifiedUndoButton();
+      const undoButtonAfterLMUpload = document.getElementById("clearUnifiedInventoryBtn");
+      if (undoButtonAfterLMUpload) undoButtonAfterLMUpload.disabled = false;
+      // The file is stored under today's upload date. If the user is currently
+      // viewing another Business Date, immediately switch the active dataset
+      // back to that date so a today's upload cannot leak into yesterday.
+      try {
+        const selectedDate = getBusinessDateValue();
+        const uploadDate = (typeof getNOL3TodayDate === "function") ? getNOL3TodayDate() : new Date().toISOString().slice(0, 10);
+        if (selectedDate !== uploadDate && typeof NOL3.loadLMHistoryForDate === "function") {
+          await NOL3.loadLMHistoryForDate(selectedDate);
+        }
+      } catch (error) {
+        console.warn("NOL3: Could not restore selected Business Date after upload.", error);
+      }
+      updateLMFilterStatus();
+
+      window.dispatchEvent(new CustomEvent("inventoryloaded", {
+        detail: {
+          type: "lm",
+          fileName: NOL3.lmInventory.fileName,
+          totalRows: NOL3.lmInventory.rows.length,
+          headers: NOL3.lmInventory.headers,
+          mode: forwardUpdates.length ? (fullSnapshots.length ? "snapshot-plus-forward" : "incremental") : "snapshot"
+        }
+      }));
+
+      console.log(
+        "LM Inventory batch loaded:",
+        files.map(f => f.name),
+        `full snapshots: ${fullSnapshots.length}`,
+        `forward updates: ${forwardUpdates.length}`,
+        `total unique rows: ${NOL3.lmInventory.rows.length}`
+      );
     });
 
     NOL3.lmInventory = NOL3.lmInventory || {
@@ -2880,48 +3066,100 @@ window.NOL3.escapeHTML = function(value) {
     };
 
     const saveCurrentLMData = (files) => {
-      NOL3.saveUploadedData('lm', files, NOL3.lmInventory);
+      return NOL3.saveUploadedData('lm', files, NOL3.lmInventory);
     };
 
-    NOL3.readLMInventoryFile = function (file) {
-      NOL3.readCSVFile(file, (result) => {
+    NOL3.readLMInventoryFile = async function (file) {
+      if (!file) return;
+      // Keep single-file uploads on exactly the same code path as stacked
+      // uploads so a Forward Order file can never accidentally replace the
+      // full LM snapshot with only its own rows.
+      const isForward = isForwardOrderFile(file);
+      try {
+        const result = await new Promise((resolve) => NOL3.readCSVFile(file, resolve));
         const parsed = parseCSVRows(result.rawText);
         if (!parsed.length) return;
-
         const headers = parsed[0].map(value => value.trim());
         const rows = parsed.slice(1).filter(row => row.some(value => String(value || "").trim() !== ""));
 
-        const merged = mergeLMInventoryRows(NOL3.lmInventory, headers, rows);
-        const previousFiles = Array.isArray(NOL3.lmInventory?.files) ? NOL3.lmInventory.files : [];
+        /*
+         * Use today's persisted snapshot as the base for BOTH normal LM and
+         * Forward Order uploads. This keeps the single-file API consistent
+         * with the main upload handler and prevents a normal file from
+         * replacing the accumulated snapshot.
+         */
+        let baseInventory = { headers: [], rows: [], files: [] };
+        const uploadDate = (typeof getNOL3TodayDate === "function")
+          ? getNOL3TodayDate()
+          : new Date().toISOString().slice(0, 10);
+
+        try {
+          const savedLM = await NOL3.getLMHistorySnapshot(uploadDate);
+          if (savedLM?.dataset && Array.isArray(savedLM.dataset.rows)) {
+            baseInventory = {
+              headers: Array.isArray(savedLM.dataset.headers) ? savedLM.dataset.headers : [],
+              rows: savedLM.dataset.rows,
+              files: Array.isArray(savedLM.files) ? savedLM.files : []
+            };
+          } else if (NOL3.lmInventory && Array.isArray(NOL3.lmInventory.rows)) {
+            baseInventory = NOL3.lmInventory;
+          }
+        } catch (_) {
+          if (NOL3.lmInventory && Array.isArray(NOL3.lmInventory.rows)) {
+            baseInventory = NOL3.lmInventory;
+          }
+        }
+
+        const merged = mergeLMInventoryRows(baseInventory, headers, rows);
+        const baseFiles = Array.isArray(baseInventory.files) ? baseInventory.files : [];
+        const allFiles = [...baseFiles, file].filter((item, index, arr) =>
+          arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
+        );
+
         NOL3.lmInventory = {
-          files: [...previousFiles, file].filter((item, index, arr) =>
-            arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
-          ),
-          fileName: [...previousFiles.map(f => f.name), file.name].filter((name, index, arr) => arr.indexOf(name) === index).join(', '),
+          files: allFiles,
+          fileName: allFiles.map(f => f.name).join(', '),
           headers: merged.headers,
           rows: merged.rows,
           filteredRows: [],
           loadedAt: new Date().toISOString()
         };
 
-        saveCurrentLMData([file]);
-        if (clearLMBtn) clearLMBtn.disabled = false;
-        updateLMFilterStatus();
-        console.log(
-          "LM Inventory loaded:",
-          result.fileName,
-          `${rows.length} data rows`
-        );
+        try {
+          const hubForFreeze = getSelectedHub() || "__default__";
+          const businessDateForFreeze = getBusinessDateValue();
+          const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
+          delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+          NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
+        } catch (_) {}
 
+        await saveCurrentLMData(allFiles);
+        // Keep the visible dataset aligned with the selected Business Date.
+        // Today's upload is stored in today's history even when another date
+        // is currently selected in the picker.
+        try {
+          const selectedDate = getBusinessDateValue();
+          const uploadDate = (typeof getNOL3TodayDate === "function") ? getNOL3TodayDate() : new Date().toISOString().slice(0, 10);
+          if (selectedDate !== uploadDate && typeof NOL3.loadLMHistoryForDate === "function") {
+            await NOL3.loadLMHistoryForDate(selectedDate);
+          }
+        } catch (error) {
+          console.warn("NOL3: Could not restore selected Business Date after upload.", error);
+        }
+        updateLMFilterStatus();
         window.dispatchEvent(new CustomEvent("inventoryloaded", {
           detail: {
             type: "lm",
-            fileName: result.fileName,
-            totalRows: rows.length,
-            headers
+            fileName: NOL3.lmInventory.fileName,
+            totalRows: NOL3.lmInventory.rows.length,
+            addedRows: rows.length,
+            mode: isForward ? "incremental" : "snapshot",
+            headers: merged.headers
           }
         }));
-      });
+      } catch (error) {
+        console.error("NOL3: Could not load LM inventory file.", error);
+      }
     };
 
     const parseCSVRows = (text) => {
@@ -3067,86 +3305,196 @@ window.NOL3.escapeHTML = function(value) {
           if (orderIdx < 0) throw new Error('Order ID column not found');
           if (statusIdx < 0) throw new Error('Status column not found');
 
-          // Load the previous unified snapshot. It is the only source used for
-          // merging, so an upload never replaces orders that were not in the file.
+          // EVERY Inventory upload is incremental/stacked.
+          //
+          // Normal inventory file:
+          //   previous inventory + new file
+          //
+          // Forward Order file:
+          //   previous inventory + forward update
+          //
+          // Duplicate Order IDs are updated by the newest uploaded record.
+          // New Order IDs are added. Nothing is replaced wholesale.
+          const isForwardUpdate = isForwardOrderFile(file);
           let previousRecord = null;
-          let previousRows = [];
-          let previousHeaders = headers;
+          let previousLMRecord = null;
+          let previousLMHistory = null;
+          let uploadDateForUndo = (typeof getNOL3TodayDate === 'function')
+            ? getNOL3TodayDate()
+            : new Date().toISOString().slice(0, 10);
+
           try {
             previousRecord = await NOL3._storageGet('unifiedInventory');
-            if (previousRecord?.dataset && Array.isArray(previousRecord.dataset.rows)) {
-              previousRows = previousRecord.dataset.rows;
-              previousHeaders = Array.isArray(previousRecord.dataset.headers) && previousRecord.dataset.headers.length
-                ? previousRecord.dataset.headers : headers;
+            previousLMRecord = await NOL3._storageGet('lm');
+            if (typeof NOL3.getLMHistorySnapshot === 'function') {
+              previousLMHistory = await NOL3.getLMHistorySnapshot(uploadDateForUndo);
             }
           } catch (e) {
-            console.warn('NOL3: Could not read previous unified inventory. Starting a new inventory.', e);
+            console.warn('NOL3: Could not read previous inventory state for undo.', e);
           }
 
-          // Save exactly one undo point: the complete state immediately before this upload.
-          if (previousRecord?.dataset?.rows) {
-            try {
-              await NOL3._storagePut({
-                type: 'unifiedInventoryUndo',
-                snapshot: previousRecord,
+          // Keep an in-memory undo point too. This is important for local HTML
+          // files opened from Android Downloads/content:// where IndexedDB can be
+          // unavailable or unreliable.
+          NOL3._inventoryUndoMemory = {
+            snapshot: previousRecord || null,
+            lmRecord: previousLMRecord || null,
+            lmHistory: previousLMHistory || null,
+            uploadDate: uploadDateForUndo,
+            savedAt: new Date().toISOString()
+          };
+
+          // Save the COMPLETE pre-upload state. Undo must restore Unified
+          // Inventory, the LM compatibility record, and today's date-specific
+          // LM snapshot together. Otherwise restoreSavedUploads can immediately
+          // bring the just-undone upload back from the LM/history record.
+          try {
+            const emptyDataset = {
+              fileName: '',
+              headers: [],
+              rows: [],
+              lmRows: [],
+              incomingRows: [],
+              rawText: '',
+              loadedAt: new Date().toISOString()
+            };
+            await NOL3._storagePut({
+              type: 'unifiedInventoryUndo',
+              snapshot: previousRecord || {
+                type: 'unifiedInventory',
+                files: [],
+                dataset: emptyDataset,
                 savedAt: new Date().toISOString()
-              });
-            } catch (e) {
-              console.warn('NOL3: Could not save undo point; upload will continue.', e);
-            }
+              },
+              lmRecord: previousLMRecord || null,
+              lmHistory: previousLMHistory || null,
+              uploadDate: uploadDateForUndo,
+              savedAt: new Date().toISOString()
+            });
+          } catch (e) {
+            console.warn('NOL3: Could not save undo point; upload will continue.', e);
           }
 
-          // Build one canonical header set, preserving old columns and adding new ones.
-          const canonicalHeaders = [...previousHeaders];
-          headers.forEach(h => {
-            if (!canonicalHeaders.some(x => String(x).trim().toLowerCase() === String(h).trim().toLowerCase())) {
-              canonicalHeaders.push(h);
-            }
-          });
+          // A unified upload can be either an LM inventory export, an Incoming
+          // inventory/transfer export, or a mixed export.
+          //
+          // IMPORTANT:
+          // - An LM-only upload replaces LM data but PRESERVES the current Incoming data.
+          // - An Incoming-only upload replaces Incoming data but PRESERVES the current LM data.
+          // - A mixed upload replaces both partitions with the contents of that upload.
+          //
+          // This prevents an Incoming transfer file (for example, trans.csv) from
+          // wiping the LM snapshot that drives Town counts, On-Floor Orders and
+          // Total Volume. Planning settings, zones, town arrangements, exceptions,
+          // and riders are stored separately and are never touched here.
+
+          const canonicalHeaders = Array.isArray(headers) ? [...headers] : [];
           const canonIndex = new Map(canonicalHeaders.map((h,i) => [String(h).trim().toLowerCase(), i]));
+
           const toCanonical = (row, rowHeaders) => {
+            if (rowHeaders === canonicalHeaders) return [...row];
             const out = Array(canonicalHeaders.length).fill('');
-            rowHeaders.forEach((h,i) => {
+            (Array.isArray(rowHeaders) ? rowHeaders : []).forEach((h,i) => {
               const j = canonIndex.get(String(h).trim().toLowerCase());
               if (j !== undefined) out[j] = row[i] ?? '';
             });
             return out;
           };
 
-          const mergedMap = new Map();
-          previousRows.forEach(row => {
-            const r = toCanonical(row, previousHeaders);
-            const id = String(r[canonIndex.get('order id')] ?? '').trim();
-            if (id) mergedMap.set(id, r);
-          });
-          let addedCount = 0, updatedCount = 0;
-          newRows.forEach(row => {
-            const r = toCanonical(row, headers);
-            const id = String(r[canonIndex.get('order id')] ?? '').trim();
-            if (!id) return;
-            if (mergedMap.has(id)) updatedCount++; else addedCount++;
-            // The newest upload is authoritative for this Order ID.
-            mergedMap.set(id, r);
-          });
-          const mergedRows = [...mergedMap.values()];
+          const orderIndex = canonIndex.get('order id');
+          if (orderIndex === undefined) throw new Error('Order ID column not found');
 
-          // Preserve the existing status partition used by all calculations.
           const lmStatuses = new Set(['LMHub_Received', 'Delivered', 'Delivering', 'OnHold']);
           const incomingStatuses = new Set(['SOC_LHTransported', 'SOC_LHTransporting', 'SOC_Packed', 'SOC_Packing']);
-          const mergedStatusIdx = canonIndex.get('status');
-          const lmRows = [], incomingRows = [];
-          let otherCount = 0;
-          mergedRows.forEach(row => {
-            const st = String(row[mergedStatusIdx] ?? '').trim();
-            if (lmStatuses.has(st)) lmRows.push(row);
-            else if (incomingStatuses.has(st)) incomingRows.push(row);
-            else otherCount++;
+          const statusIndex = canonIndex.get('status');
+
+          const classifyRows = (rows, rowHeaders) => {
+            const lm = [], incoming = [], other = [];
+            (Array.isArray(rows) ? rows : []).forEach(row => {
+              const mapped = toCanonical(row, rowHeaders);
+              const id = String(mapped[orderIndex] ?? '').trim();
+              if (!id) return;
+              const status = statusIndex >= 0 ? String(mapped[statusIndex] ?? '').trim() : '';
+              if (lmStatuses.has(status)) lm.push(mapped);
+              else if (incomingStatuses.has(status)) incoming.push(mapped);
+              else other.push(mapped);
+            });
+            return { lm, incoming, other };
+          };
+
+          // De-duplicate by Order ID inside each partition.
+          const uniqueByOrderId = (rows) => {
+            const map = new Map();
+            (Array.isArray(rows) ? rows : []).forEach(row => {
+              const id = String(row?.[orderIndex] ?? '').trim();
+              if (id) map.set(id, row);
+            });
+            return [...map.values()];
+          };
+
+          const uploaded = classifyRows(newRows, headers);
+          const hasLMUpload = uploaded.lm.length > 0;
+          const hasIncomingUpload = uploaded.incoming.length > 0;
+
+          // Previous unified state is used only to preserve the partition that
+          // the current upload does not contain.
+          const previousDataset = previousRecord?.dataset || {};
+          const previousHeaders = Array.isArray(previousDataset.headers)
+            ? previousDataset.headers
+            : canonicalHeaders;
+
+          const previousLM = Array.isArray(previousDataset.lmRows)
+            ? previousDataset.lmRows
+            : (Array.isArray(NOL3.lmInventory?.rows) ? NOL3.lmInventory.rows : []);
+
+          const previousIncoming = Array.isArray(previousDataset.incomingRows)
+            ? previousDataset.incomingRows
+            : (Array.isArray(NOL3.incomingInventory?.rows) ? NOL3.incomingInventory.rows : []);
+
+          const previousLMCanonical = uniqueByOrderId(previousLM.map(row => toCanonical(row, previousHeaders)));
+          const previousIncomingCanonical = uniqueByOrderId(previousIncoming.map(row => toCanonical(row, previousHeaders)));
+
+          // Incoming-only file: keep LM so Town count and Total Volume do not reset.
+          // LM-only file: keep Incoming so Incoming Orders do not disappear.
+          // Mixed file: use the uploaded partitions as the complete replacement.
+          const lmRows = uniqueByOrderId(
+            hasLMUpload ? uploaded.lm : previousLMCanonical
+          );
+          const incomingRows = uniqueByOrderId(
+            hasIncomingUpload ? uploaded.incoming : previousIncomingCanonical
+          );
+
+          // Keep unknown statuses from the new upload, but never let them wipe
+          // either recognized operational partition.
+          const otherRows = uploaded.other;
+          const otherCount = otherRows.length;
+          const mergedRows = [...lmRows, ...incomingRows, ...otherRows];
+
+          const addedCount = newRows.length;
+          const updatedCount = 0;
+
+          // Keep file metadata for the active unified snapshot. The metadata is
+          // separate from the actual LM/Incoming partitions so preserving one
+          // partition does not accidentally discard its file history.
+          const previousFiles = Array.isArray(previousRecord?.files) ? previousRecord.files : [];
+          const currentFileMeta = {
+            name: file.name,
+            lastModified: file.lastModified || 0,
+            text
+          };
+          const fileMeta = [
+            ...previousFiles,
+            currentFileMeta
+          ].filter((item, index, arr) => {
+            return arr.findIndex(x =>
+              x?.name === item?.name &&
+              (x?.lastModified || 0) === (item?.lastModified || 0)
+            ) === index;
           });
 
           const savedAt = new Date().toISOString();
-          const fileMeta = [{ name: file.name, lastModified: file.lastModified || 0, text }];
           const dataset = {
-            fileName: file.name,
+            fileName: fileMeta.map(item => item.name).join(', '),
             headers: canonicalHeaders,
             rows: mergedRows,
             lmRows,
@@ -3159,7 +3507,7 @@ window.NOL3.escapeHTML = function(value) {
           // partition; no calculation formulas are changed here.
           NOL3.lmInventory = {
             files: fileMeta,
-            fileName: file.name,
+            fileName: fileMeta.map(item => item.name).join(', '),
             headers: canonicalHeaders,
             rows: lmRows,
             filteredRows: [],
@@ -3168,7 +3516,7 @@ window.NOL3.escapeHTML = function(value) {
           };
           NOL3.incomingInventory = {
             files: fileMeta,
-            fileName: file.name,
+            fileName: fileMeta.map(item => item.name).join(', '),
             headers: canonicalHeaders,
             rows: incomingRows,
             filteredRows: [],
@@ -3178,13 +3526,71 @@ window.NOL3.escapeHTML = function(value) {
           };
           if (typeof filterLMForHub === 'function') filterLMForHub(NOL3.lmInventory);
 
-          // The unified snapshot is the single persistent source of truth.
+          // The unified snapshot is the persistent source of truth. Keep the LM
+          // compatibility record synchronized as well so a later restore cannot
+          // resurrect an older dedicated LM snapshot over this upload.
           await NOL3._storagePut({
             type: 'unifiedInventory',
             files: fileMeta,
             dataset,
             savedAt
           });
+          if (typeof NOL3._refreshUnifiedUndoButton === "function") {
+            await NOL3._refreshUnifiedUndoButton();
+          }
+          // A successful upload always creates an undo point.
+          const undoButtonAfterUpload = document.getElementById("clearUnifiedInventoryBtn");
+          if (undoButtonAfterUpload) undoButtonAfterUpload.disabled = false;
+          await NOL3._storagePut({
+            type: 'lm',
+            files: fileMeta,
+            dataset: {
+              fileName: file.name,
+              headers: canonicalHeaders,
+              rows: lmRows,
+              rawText: text,
+              loadedAt: savedAt
+            },
+            savedAt
+          });
+
+          // IMPORTANT: Unified Inventory uploads must also be written to the
+          // date-specific LM history. Otherwise changing Business Date clears
+          // the active dataset and returning to today has nothing to restore.
+          // The upload belongs to the actual Philippines calendar date of the
+          // upload, never to whichever Business Date happens to be selected.
+          try {
+            const uploadDate = (typeof getNOL3TodayDate === 'function')
+              ? getNOL3TodayDate()
+              : new Date().toISOString().slice(0, 10);
+            await NOL3.saveLMHistorySnapshot(uploadDate, {
+              fileName: file.name,
+              headers: canonicalHeaders,
+              rows: lmRows,
+              rawText: text,
+              loadedAt: savedAt
+            }, fileMeta);
+
+            // If the user was viewing another Business Date while uploading,
+            // immediately restore that date rather than showing today's upload.
+            const selectedDate = typeof getBusinessDateValue === 'function'
+              ? getBusinessDateValue()
+              : uploadDate;
+            if (selectedDate !== uploadDate && typeof NOL3.loadLMHistoryForDate === 'function') {
+              await NOL3.loadLMHistoryForDate(selectedDate);
+            }
+          } catch (historyError) {
+            console.warn('NOL3: Could not save date-specific LM history after unified upload.', historyError);
+          }
+
+          // Any inventory update invalidates the current cached business-day metric.
+          try {
+            const hubForFreeze = getSelectedHub() || '__default__';
+            const businessDateForFreeze = getBusinessDateValue();
+            const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || '{}');
+            delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+            NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
+          } catch (_) {}
 
           if (statusEl) {
             statusEl.textContent = `${mergedRows.length.toLocaleString()} total orders · ${lmRows.length.toLocaleString()} LM · ${incomingRows.length.toLocaleString()} Incoming · ${addedCount.toLocaleString()} added · ${updatedCount.toLocaleString()} updated${otherCount ? ` · ${otherCount.toLocaleString()} other status` : ''}`;
@@ -3197,7 +3603,7 @@ window.NOL3.escapeHTML = function(value) {
           window.dispatchEvent(new CustomEvent('inventoryloaded', { detail: { type: 'incoming', data: NOL3.incomingInventory } }));
           window.dispatchEvent(new CustomEvent('unifiedinventoryloaded', { detail: { fileName: file.name, rowCount: mergedRows.length } }));
           showInventoryUploadSuccess('Inventory', file.name, mergedRows.length);
-          console.log('Unified Inventory merged successfully:', file.name, 'new rows:', newRows.length, 'total orders:', mergedRows.length);
+          console.log('Unified Inventory snapshot loaded:', file.name, 'rows in upload:', newRows.length, 'unique orders:', mergedRows.length);
         } catch (error) {
           console.error('NOL3: Could not process unified inventory.', error);
           if (statusEl) statusEl.textContent = `Could not process file: ${error?.message || 'unknown error'}`;
@@ -3233,35 +3639,102 @@ window.NOL3.escapeHTML = function(value) {
     });
 
     if (unifiedInventoryClearBtn) {
-      // Enabled only when there is a previous inventory state to restore.
+      // The button performs the undo directly. This avoids stale event handlers
+      // when the inventory page is re-rendered after an upload.
       unifiedInventoryClearBtn.disabled = true;
       NOL3._refreshUnifiedUndoButton = async function () {
         try {
-          const undo = await NOL3._storageGet('unifiedInventoryUndo');
-          unifiedInventoryClearBtn.disabled = !(undo && undo.snapshot && undo.snapshot.dataset);
+          const undo = NOL3._inventoryUndoMemory || await NOL3._storageGet('unifiedInventoryUndo');
+          unifiedInventoryClearBtn.disabled = !(undo && (undo.snapshot || undo.lmRecord || undo.lmHistory));
         } catch (e) {
+          console.warn("NOL3: Could not check inventory undo state.", e);
           unifiedInventoryClearBtn.disabled = true;
         }
       };
       NOL3._refreshUnifiedUndoButton();
-      unifiedInventoryClearBtn.addEventListener("click", () => {
-        if (!unifiedInventoryClearBtn.disabled) document.getElementById("clearUnifiedInventoryModal")?.classList.add("show");
-      });
     }
     document.getElementById("cancelClearUnifiedInventory")?.addEventListener("click", () => {
       document.getElementById("clearUnifiedInventoryModal")?.classList.remove("show");
     });
     NOL3.undoLastUnifiedInventoryUpload = async function () {
-      const undo = await NOL3._storageGet('unifiedInventoryUndo');
-      if (!undo || !undo.snapshot || !undo.snapshot.dataset) throw new Error('No previous upload is available to undo.');
+      let undo = NOL3._inventoryUndoMemory || null;
+      if (!undo) undo = await NOL3._storageGet('unifiedInventoryUndo');
+      if (!undo || (!undo.snapshot && !undo.lmRecord && !undo.lmHistory)) {
+        throw new Error('No previous upload is available to undo.');
+      }
 
-      // Restore the exact pre-upload snapshot.
-      await NOL3._storagePut(undo.snapshot);
-      try { await remove("unifiedInventoryUndo"); } catch (e) { console.warn("NOL3: Could not clear used undo point.", e); }
-      await NOL3.restoreSavedUploads();
-      if (typeof NOL3.updateInventoryUploadSummaries === "function") await NOL3.updateInventoryUploadSummaries();
-      window.dispatchEvent(new CustomEvent("unifiedinventoryundone"));
+      // Restore persistent records when storage is available. The live dashboard
+      // is restored independently below so local HTML/content:// origins still
+      // get a working immediate Undo even if IndexedDB rejects the operation.
+      let storageRestored = true;
+      try {
+        if (undo.snapshot) await NOL3._storagePut(undo.snapshot); else await remove('unifiedInventory');
+        if (undo.lmRecord && undo.lmRecord.dataset) await NOL3._storagePut(undo.lmRecord); else await remove('lm');
+        const undoDate = String(undo.uploadDate || '').trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(undoDate)) {
+          if (undo.lmHistory && undo.lmHistory.dataset) await NOL3.saveLMHistorySnapshot(undoDate, undo.lmHistory.dataset, undo.lmHistory.files || []);
+          else await removeLMHistory(undoDate);
+        }
+        await remove('unifiedInventoryUndo');
+      } catch (e) {
+        storageRestored = false;
+        console.warn('NOL3: Persistent Undo restore failed; continuing with live-memory restore.', e);
+      }
+
+      const unified = undo.snapshot?.dataset;
+      if (unified && Array.isArray(unified.rows)) {
+        const base = {
+          fileName: unified.fileName || undo.snapshot.files?.[0]?.name || 'inventory.csv',
+          headers: Array.isArray(unified.headers) ? unified.headers : [],
+          loadedAt: unified.loadedAt || new Date().toISOString(),
+          rawText: typeof unified.rawText === 'string' ? unified.rawText : ''
+        };
+        const lmRows = Array.isArray(unified.lmRows) ? unified.lmRows : [];
+        const incomingRows = Array.isArray(unified.incomingRows) ? unified.incomingRows : [];
+        const lmDataset = undo.lmRecord?.dataset;
+        NOL3.lmInventory = { ...base, rows: Array.isArray(lmDataset?.rows) ? lmDataset.rows : lmRows, filteredRows: [], rowCount: Array.isArray(lmDataset?.rows) ? lmDataset.rows.length : lmRows.length, files: undo.lmRecord?.files || undo.snapshot.files || [] };
+        NOL3.incomingInventory = { ...base, rows: incomingRows, filteredRows: [], rowCount: incomingRows.length, files: undo.snapshot.files || [] };
+      } else if (undo.lmRecord?.dataset && Array.isArray(undo.lmRecord.dataset.rows)) {
+        const d = undo.lmRecord.dataset;
+        NOL3.lmInventory = { fileName: d.fileName || '', headers: Array.isArray(d.headers) ? d.headers : [], rows: d.rows, filteredRows: [], rowCount: d.rows.length, files: undo.lmRecord.files || [] };
+        NOL3.incomingInventory = null;
+      } else {
+        NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: '', headers: [], loadedAt: new Date().toISOString(), rowCount: 0 };
+        NOL3.incomingInventory = null;
+      }
+
+      if (typeof filterLMForHub === 'function') filterLMForHub(NOL3.lmInventory);
+      if (typeof updateLMFilterStatus === 'function') updateLMFilterStatus();
+      if (typeof NOL3.updateInventoryUploadSummaries === 'function') await NOL3.updateInventoryUploadSummaries();
+      window.dispatchEvent(new CustomEvent('inventoryloaded', { detail: { type: 'lm', totalRows: NOL3.lmInventory?.rows?.length || 0, undone: true, storageRestored } }));
+      window.dispatchEvent(new CustomEvent('inventoryloaded', { detail: { type: 'incoming', totalRows: NOL3.incomingInventory?.rows?.length || 0, undone: true } }));
+      window.dispatchEvent(new CustomEvent('unifiedinventoryundone', { detail: { storageRestored } }));
+      NOL3._inventoryUndoMemory = null;
     };
+    // Global handler used by the Inventory button itself. Because the inventory
+    // page can be rebuilt, inline dispatch is more reliable than a listener tied
+    // to one particular rendered button node.
+    window.NOL3_undoUnifiedInventory = async function(event) {
+      if (event) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      const button = document.getElementById("clearUnifiedInventoryBtn");
+      const statusEl = document.getElementById("unifiedInventoryStatus");
+      if (button) button.disabled = true;
+      try {
+        await NOL3.undoLastUnifiedInventoryUpload();
+        if (statusEl) statusEl.textContent = "Last upload undone.";
+      } catch (e) {
+        console.error("NOL3: Could not undo last inventory upload.", e);
+        if (statusEl) statusEl.textContent = `Could not undo upload: ${e?.message || 'unknown error'}`;
+      } finally {
+        if (typeof NOL3._refreshUnifiedUndoButton === "function") {
+          await NOL3._refreshUnifiedUndoButton();
+        }
+      }
+    };
+
     document.getElementById("confirmClearUnifiedInventory")?.addEventListener("click", async () => {
       try {
         await NOL3.undoLastUnifiedInventoryUpload();
@@ -3659,7 +4132,18 @@ NOL3.pages.planning = function (root) {
           </div>
         </div>
 
-        <div class="planning-panel" id="planning-panel-incoming">
+        <div class="confirm-modal" id="confirmIncomingArrivedModal" role="dialog" aria-modal="true" aria-labelledby="confirmIncomingArrivedTitle" style="z-index:100002">
+        <div class="confirm-modal-card">
+          <h3 class="confirm-modal-title" id="confirmIncomingArrivedTitle">Confirm Arrived?</h3>
+          <p class="confirm-modal-text" id="confirmIncomingArrivedText">Confirm that this incoming linehaul has arrived?</p>
+          <div class="confirm-modal-actions">
+            <button class="confirm-modal-cancel" id="cancelIncomingArrived" type="button">Cancel</button>
+            <button class="confirm-modal-remove" id="confirmIncomingArrived" type="button">Confirm</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="planning-panel" id="planning-panel-incoming">
           <div class="card">
             <h3>Incoming Orders</h3>
             <p class="subtle">Line haul tasks matched from Incoming Inventory using SPX TN ↔ Order ID.</p>
@@ -3751,7 +4235,7 @@ NOL3.pages.planning = function (root) {
     const BUSINESS_DAY_SETTINGS_KEY = "nol3_business_day_settings_v1";
     const BUSINESS_DAY_DATE_KEY = "nol3_business_day_date_v1";
     const BUSINESS_DAY_DEFAULT_START = 3;
-    const BUSINESS_DAY_DEFAULT_COT = 14;
+    const BUSINESS_DAY_DEFAULT_COT = 15;
 
     const formatBusinessDateInput = (date = new Date()) => {
       const y = date.getFullYear();
@@ -3789,20 +4273,16 @@ NOL3.pages.planning = function (root) {
     };
 
     const getBusinessDateValue = () => {
-      // Business Date is session state. Once established, NEVER replace it
-      // with today's date merely because a menu/topbar is being rendered.
+      // Planning always opens on the current Philippines calendar date.
+      // A previously selected date is still usable during the current session,
+      // but a page refresh/new session starts on today rather than yesterday's
+      // saved business date.
       if (/^\d{4}-\d{2}-\d{2}$/.test(String(NOL3.currentBusinessDate || ""))) {
         return NOL3.currentBusinessDate;
       }
-      try {
-        const saved = String(NOL3Storage.get(BUSINESS_DAY_DATE_KEY) || "").trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(saved)) {
-          NOL3.currentBusinessDate = saved;
-          return saved;
-        }
-      } catch (_) {}
-      // Only use today when there is genuinely no existing Business Date.
-      const today = formatBusinessDateInput(new Date());
+      const today = (typeof getNOL3TodayDate === "function")
+        ? getNOL3TodayDate()
+        : formatBusinessDateInput(new Date());
       NOL3.currentBusinessDate = today;
       try { NOL3Storage.set(BUSINESS_DAY_DATE_KEY, today); } catch (_) {}
       return today;
@@ -3833,7 +4313,7 @@ NOL3.pages.planning = function (root) {
     // computed volume is captured once and reused from then on for that date,
     // regardless of later LM Inventory uploads. Keyed per hub + business date so
     // it resets automatically the moment the business date changes.
-    const FROZEN_TODAY_VOLUME_KEY = "nol3_frozen_today_volume_v1";
+    const FROZEN_TODAY_VOLUME_KEY = "nol3_frozen_today_volume_v2";
     const loadFrozenTodayVolumeStore = () => {
       try {
         const raw = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
@@ -3861,7 +4341,7 @@ NOL3.pages.planning = function (root) {
       Object.keys(stored).forEach(key => {
         const value = stored[key];
         if (value && Number(value.businessDayStartHour) === 0 && Number(value.cotHour) === 12) {
-          stored[key] = { businessDayStartHour: 3, cotHour: 14 };
+          stored[key] = { businessDayStartHour: 3, cotHour: 15 };
           changed = true;
         }
       });
@@ -3936,79 +4416,65 @@ NOL3.pages.planning = function (root) {
     ]);
 
     const getBusinessDayMetrics = () => {
-      const result = { todayVolume: 0, totalDispatched: 0, totalBacklogs: 0, dueIds: new Set(), dispatchedIds: new Set(), receivedIndex: -1, pickedUpIndex: -1, warning: "" };
+      const result = {
+        todayVolume: 0,
+        totalDispatched: 0,
+        totalBacklogs: 0,
+        dueIds: new Set(),
+        dispatchedIds: new Set(),
+        receivedIndex: -1,
+        pickedUpIndex: -1,
+        warning: ""
+      };
       const lm = NOL3.lmInventory;
       if (!lm || !Array.isArray(lm.filteredRows) || !Array.isArray(lm.headers)) {
         result.warning = "Upload LM Inventory to calculate today's volume, dispatches, and backlogs.";
         return result;
       }
+
       const headers = lm.headers;
+      const exceptionSet = getPlanningExceptionSet();
       result.receivedIndex = findBusinessTimestampIndex(headers, businessTimestampCandidates.received);
       result.pickedUpIndex = findBusinessTimestampIndex(headers, businessTimestampCandidates.pickedUp);
       const identityIndex = getBusinessIdentityIndex(headers);
-
-      // For LM inventory, Business Date volume is based on when the parcel was received
-      // at its current station. Current Station Received Time is intentionally preferred
-      // over the original Received Time, which can belong to an earlier station/day.
-      // Pickup/dispatched data is optional and does not control today's received volume.
-      if (result.receivedIndex < 0) {
-        // Last-resort header detection for common LM export variants.
-        const normalizedHeaders = headers.map(normalizeIncomingHeader);
-        const receivedFallback = normalizedHeaders.findIndex(h =>
-          /(received|receive|inbound|arrival|arrived)/.test(h) &&
-          /(date|time|at|timestamp|on)/.test(h)
-        );
-        if (receivedFallback >= 0) result.receivedIndex = receivedFallback;
-      }
-      if (result.receivedIndex < 0) {
-        result.warning = "LM Inventory needs a received/inbound date or timestamp column to calculate Business Date volume.";
-        return result;
-      }
-      const settings = getHubBusinessDaySettings();
-      const { start, end, cot, businessDate } = getBusinessWindow(new Date(), settings);
-      const exceptionSet = getPlanningExceptionSet();
       const rowIdentity = (row, index) => {
         const raw = identityIndex >= 0 ? row[identityIndex] : "";
         const normalized = normalizeIncomingKey(raw);
         return normalized || `__row_${index}`;
       };
+
+      const settings = getHubBusinessDaySettings();
+      const { start, end, cot, businessDate } = getBusinessWindow(new Date(), settings);
+
+      // Planning Total Volume is the CURRENT on-floor snapshot for the selected
+      // hub. It intentionally does not filter by Current Station Received Time,
+      // CFR1, LH COT, carry-over, or planning exceptions. This matches the
+      // operator workflow: upload the LM file, filter Current Station = selected
+      // hub, and count the resulting orders.
       lm.filteredRows.forEach((row, index) => {
         if (rowMatchesPlanningException(row, headers, exceptionSet)) return;
-        const receivedAt = parseBusinessTimestamp(row[result.receivedIndex]);
-        const pickedAt = result.pickedUpIndex >= 0 ? parseBusinessTimestamp(row[result.pickedUpIndex]) : null;
-        if (!receivedAt) return;
         const id = rowIdentity(row, index);
-        // 1) Carried-over backlog: received before business-day start and not picked up before that start.
-        const carriedOver = receivedAt.getTime() < start.getTime() && (!pickedAt || pickedAt.getTime() < start.getTime());
-        // 2) Received during the selected business day through COT.
-        const receivedBeforeCot = receivedAt.getTime() >= start.getTime() && receivedAt.getTime() <= cot.getTime();
-        if (carriedOver || receivedBeforeCot) result.dueIds.add(id);
-        // Pickup is optional. If the LM export has it, calculate dispatched/backlog; otherwise volume still works.
-        if (pickedAt && pickedAt.getTime() >= start.getTime() && pickedAt.getTime() < end.getTime()) result.dispatchedIds.add(id);
+        result.dueIds.add(id);
+
+        const pickedAt = result.pickedUpIndex >= 0
+          ? parseBusinessTimestamp(row[result.pickedUpIndex])
+          : null;
+        if (pickedAt && pickedAt.getTime() >= start.getTime() && pickedAt.getTime() < end.getTime()) {
+          result.dispatchedIds.add(id);
+        }
       });
 
-      // Today's Volume freeze-at-COT. `dueIds` above stays live (Planning/On-Floor
-      // still filter by the live due set — unchanged), but the displayed/reported
-      // Today's Volume number is captured once LH COT is reached and reused from
-      // then on for this business date, so a later LM upload can't move it.
       const liveTodayVolume = result.dueIds.size;
-      const hubForFreeze = getSelectedHub() || "__default__";
-      const frozen = getFrozenTodayVolume(hubForFreeze);
-      let frozenValue = null;
-      if (frozen && frozen.businessDate === businessDate) {
-        frozenValue = Number(frozen.value) || 0;
-      } else if (new Date().getTime() >= cot.getTime()) {
-        frozenValue = liveTodayVolume;
-        setFrozenTodayVolume(hubForFreeze, businessDate, frozenValue);
-      }
-      result.todayVolume = frozenValue !== null ? frozenValue : liveTodayVolume;
-      result.todayVolumeFrozen = frozenValue !== null;
+      result.todayVolume = liveTodayVolume;
+      result.todayVolumeFrozen = false;
       result.liveTodayVolume = liveTodayVolume;
-
       result.totalDispatched = result.dispatchedIds.size;
-      // Total Backlogs = frozen Today's Volume minus live Total Dispatched, never negative.
       result.totalBacklogs = Math.max(0, result.todayVolume - result.totalDispatched);
-      result.start = start; result.end = end; result.cot = cot; result.settings = settings;
+      result.start = start;
+      result.end = end;
+      result.cot = cot;
+      result.settings = settings;
+      result.businessDate = businessDate;
       return result;
     };
 
@@ -4029,7 +4495,9 @@ NOL3.pages.planning = function (root) {
       }
       const f = value => value.toLocaleTimeString([], {hour:"2-digit", minute:"2-digit", hour12:false});
       const dateLabel = metrics.start.toLocaleDateString([], {year:"numeric", month:"2-digit", day:"2-digit"});
-      if (note) note.textContent = `Due ${dateLabel} · ${f(metrics.start)} start · received through ${f(metrics.cot)}`;
+      if (note) note.textContent = metrics.todayVolumeFrozen
+        ? `Frozen at COT for ${dateLabel} · current station = selected hub`
+        : `Live volume for ${dateLabel} · current station = selected hub · freezes at COT (${f(metrics.cot)})`;
       if (status) status.textContent = `${getSelectedHub() || "Selected hub"}: ${dateLabel} · ${f(metrics.start)} business-day start · ${f(metrics.cot)} COT · window ends ${f(metrics.end)}`;
     };
 
@@ -4062,12 +4530,15 @@ NOL3.pages.planning = function (root) {
       };
 
       const saveDate = () => {
-        const value = dateInput.value || formatBusinessDateInput(new Date());
+        const value = String(dateInput.value || "").trim();
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return;
+        // Business Date is an explicit user selection. Never replace it with
+        // today's date while the user is changing the picker.
+        NOL3.currentBusinessDate = value;
         saveBusinessDateValue(value);
         dateInput.value = value;
-        // Recalculate all date-dependent views immediately.
-        renderBusinessDayMetrics();
-        window.dispatchEvent(new CustomEvent("businessdatechange", { detail: { businessDate: value } }));
+        // Wait for the dated LM snapshot to load before rendering derived metrics.
+        window.dispatchEvent(new CustomEvent("businessdatechange", { detail: { businessDate: value, source: "picker" } }));
       };
 
       startInput.onchange = saveHours;
@@ -4109,33 +4580,105 @@ NOL3.pages.planning = function (root) {
       const input = document.getElementById('businessDayDate');
       if (input) input.value = normalized;
       window.dispatchEvent(new CustomEvent('businessdatechange', { detail: { businessDate: normalized } }));
-      // Refresh the currently visible page as well as the topbar.
-      setTimeout(() => {
-        try {
-          const page = NOL3.getState && NOL3.getState().currentPage;
-          if (typeof NOL3.renderTopbar === 'function') NOL3.renderTopbar();
-          if (page && typeof NOL3.renderPage === 'function') NOL3.renderPage(page);
-        } catch (_) {}
-      }, 0);
+      // The async businessdatechange handler restores the dated snapshot and
+      // rebuilds all derived views before the page is rendered.
+      if (typeof NOL3.renderTopbar === 'function') NOL3.renderTopbar();
     };
 
     // Always derive TODAY at the moment NOW is pressed. Do not rely on the
     // page-load date or the value rendered into the topbar.
-    NOL3.setBusinessDateNow = () => {
-      const now = new Date();
+    NOL3.setBusinessDateNow = async () => {
       const today = getNOL3TodayDate();
-      // Update the live control first, then persist the value.
+
+      // NOW intentionally uses the same full application refresh as the
+      // REFRESH button. This guarantees every Planning view is rebuilt from
+      // the restored/current snapshot instead of trying to update stale DOM.
       NOL3.currentBusinessDate = today;
       const input = document.getElementById("businessDayDate");
-      if (input) { input.value = today; input.dispatchEvent(new Event("input", { bubbles: true })); }
+      if (input) input.value = today;
       saveBusinessDateValue(today);
-      renderBusinessDayMetrics();
-      window.dispatchEvent(new CustomEvent("businessdatechange", { detail: { businessDate: today, source: "now" } }));
 
-      // Do not rebuild the page here. Re-rendering the page can re-run hub
-      // filtering and overwrite the already-correct filteredRows. The metric
-      // cards are refreshed directly above, and the date input is already set.
-      // Keep the uploaded LM dataset untouched when NOW is pressed.
+      try {
+        if (typeof NOL3.loadLMHistoryForDate === "function") {
+          await NOL3.loadLMHistoryForDate(today);
+        }
+      } catch (error) {
+        console.warn("NOL3: Could not restore today's LM snapshot from NOW before refresh.", error);
+      }
+
+      // Give the local snapshot write/event loop a moment to settle, then use
+      // the exact same reload path as the REFRESH button. Startup will restore
+      // today's dated snapshot and rebuild the entire Planning DOM.
+      setTimeout(() => {
+        try { window.location.reload(); } catch (_) {}
+      }, 0);
+    };
+
+    const INCOMING_ARRIVED_STORAGE_KEY = "nol3_incoming_arrived_tasks_v1";
+    let pendingIncomingArrivedTask = null;
+
+    const getArrivedIncomingTasks = () => {
+      try {
+        const raw = NOL3Storage.get(INCOMING_ARRIVED_STORAGE_KEY);
+        const parsed = JSON.parse(raw || "[]");
+        return new Set(Array.isArray(parsed) ? parsed.map(v => String(v || "").trim()).filter(Boolean) : []);
+      } catch (_) { return new Set(); }
+    };
+
+    const saveArrivedIncomingTasks = (set) => {
+      try { NOL3Storage.set(INCOMING_ARRIVED_STORAGE_KEY, JSON.stringify([...set])); } catch (_) {}
+    };
+
+    const getArrivedIncomingTownCounts = () => {
+      const taskTownCounts = getIncomingLinehaulTownCounts();
+      const arrived = getArrivedIncomingTasks();
+      const result = new Map();
+      arrived.forEach(task => {
+        const counts = taskTownCounts.get(task);
+        if (!counts) return;
+        counts.forEach((count, town) => result.set(town, (result.get(town) || 0) + Number(count || 0)));
+      });
+      return result;
+    };
+
+    const openIncomingArrivedConfirm = (task, checked) => {
+      const modal = document.getElementById("confirmIncomingArrivedModal");
+      const text = document.getElementById("confirmIncomingArrivedText");
+      if (!modal) return;
+      pendingIncomingArrivedTask = { task: String(task || "").trim(), checked: !!checked };
+      if (text) text.textContent = checked
+        ? `Confirm that ${String(task || "this incoming linehaul")} has arrived?`
+        : `Mark ${String(task || "this incoming linehaul")} as not arrived?`;
+      modal.classList.add("open");
+      modal.style.display = "flex";
+    };
+
+    const closeIncomingArrivedConfirm = () => {
+      const modal = document.getElementById("confirmIncomingArrivedModal");
+      pendingIncomingArrivedTask = null;
+      if (modal) {
+        modal.classList.remove("open");
+        modal.style.display = "none";
+      }
+    };
+
+    const applyIncomingArrivedState = (task, checked) => {
+      const value = String(task || "").trim();
+      if (!value) return;
+      const arrived = getArrivedIncomingTasks();
+      if (checked) arrived.add(value); else arrived.delete(value);
+      saveArrivedIncomingTasks(arrived);
+      window.dispatchEvent(new CustomEvent("planningchanged", {
+        detail: { type: "incoming-arrived", source: "local" }
+      }));
+      renderIncomingOrders();
+      renderIncomingLinehaulSelector();
+
+      // Rebuild the Planning summary so Total Volume immediately includes
+      // the newly confirmed/cleared linehaul.
+      if (typeof renderDeliveryAreas === 'function') renderDeliveryAreas();
+      renderOnFloorTowns();
+      updateIncomingOrdersNotification();
     };
 
     const updateIncomingOrdersNotification = () => {
@@ -4145,8 +4688,11 @@ NOL3.pages.planning = function (root) {
       try {
         if (typeof getIncomingLinehaulTownCounts === "function") {
           const taskTownCounts = getIncomingLinehaulTownCounts();
-          total = [...taskTownCounts.values()].reduce((sum, counts) =>
-            sum + [...counts.values()].reduce((n, count) => n + Number(count || 0), 0), 0);
+          const arrived = getArrivedIncomingTasks();
+          total = [...taskTownCounts.entries()].reduce((sum, [task, counts]) => {
+            if (arrived.has(task)) return sum;
+            return sum + [...counts.values()].reduce((n, count) => n + Number(count || 0), 0);
+          }, 0);
         }
       } catch (_) { total = 0; }
       badge.textContent = total.toLocaleString();
@@ -4183,10 +4729,16 @@ NOL3.pages.planning = function (root) {
       list.innerHTML = tasks.map(([task, counts], index) => {
         const towns = [...counts.entries()].sort((a,b) => b[1] - a[1] || a[0].localeCompare(b[0]));
         const total = towns.reduce((sum, [,count]) => sum + count, 0);
-        return `<div class="incoming-linehaul-card" data-linehaul-card="${index}">
+        const arrived = getArrivedIncomingTasks().has(String(task || "").trim());
+        return `<div class="incoming-linehaul-card${arrived ? ' arrived' : ''}" data-linehaul-card="${index}">
           <button class="incoming-linehaul-header" type="button" aria-expanded="false">
             <span class="incoming-linehaul-title">${NOL3.escapeHTML(task)}</span>
-            <span class="incoming-linehaul-meta"><span>${total.toLocaleString()} orders · ${towns.length.toLocaleString()} towns</span><span class="incoming-linehaul-chevron">›</span></span>
+            <span class="incoming-linehaul-meta"><span>${total.toLocaleString()} orders · ${towns.length.toLocaleString()} towns</span><span class="incoming-linehaul-chevron">›</span>
+              <label class="incoming-arrived-wrap" title="Mark linehaul as arrived">
+                <input class="incoming-arrived-checkbox" type="checkbox" data-incoming-arrived="${NOL3.escapeHTML(task)}" ${arrived ? 'checked' : ''} aria-label="Arrived">
+                <span class="incoming-arrived-label">Arrived</span>
+              </label>
+            </span>
           </button>
           <div class="incoming-linehaul-body"><div class="incoming-town-counts">
             ${towns.map(([town,count]) => `<div class="incoming-town-count"><span class="incoming-town-count-name" title="${NOL3.escapeHTML(town)}">${NOL3.escapeHTML(town)}</span><span class="incoming-town-count-value">${count.toLocaleString()}</span></div>`).join("")}
@@ -4194,12 +4746,33 @@ NOL3.pages.planning = function (root) {
         </div>`;
       }).join("");
 
-      list.querySelectorAll(".incoming-linehaul-header").forEach(button => button.addEventListener("click", () => {
+      list.querySelectorAll(".incoming-linehaul-header").forEach(button => button.addEventListener("click", (event) => {
+        if (event.target.closest(".incoming-arrived-wrap")) return;
         const card = button.closest(".incoming-linehaul-card");
         const open = card.classList.toggle("open");
         button.setAttribute("aria-expanded", open ? "true" : "false");
       }));
+      list.querySelectorAll(".incoming-arrived-checkbox").forEach(checkbox => checkbox.addEventListener("click", event => {
+        event.stopPropagation();
+      }));
+      list.querySelectorAll(".incoming-arrived-checkbox").forEach(checkbox => checkbox.addEventListener("change", event => {
+        event.stopPropagation();
+        const task = checkbox.getAttribute("data-incoming-arrived") || "";
+        const desired = checkbox.checked;
+        checkbox.checked = !desired;
+        openIncomingArrivedConfirm(task, desired);
+      }));
     };
+
+    document.getElementById("cancelIncomingArrived")?.addEventListener("click", closeIncomingArrivedConfirm);
+    document.getElementById("confirmIncomingArrived")?.addEventListener("click", () => {
+      const pending = pendingIncomingArrivedTask;
+      closeIncomingArrivedConfirm();
+      if (pending) applyIncomingArrivedState(pending.task, pending.checked);
+    });
+    document.getElementById("confirmIncomingArrivedModal")?.addEventListener("click", event => {
+      if (event.target.id === "confirmIncomingArrivedModal") closeIncomingArrivedConfirm();
+    });
 
     window.addEventListener("inventoryloaded", renderIncomingOrders);
     window.addEventListener("inventorycleared", renderIncomingOrders);
@@ -4269,6 +4842,10 @@ NOL3.pages.planning = function (root) {
 
       const spxToTasks = new Map();
       linehaul.rows.forEach(row => {
+        // The exception may exist only in the From-To/Linehaul export.
+        // Exclude it here before creating the SPX -> task relationship.
+        if (rowMatchesPlanningException(row, lh, exceptionSet)) return;
+
         const spx = norm(row[spxIndex]);
         const task = String(row[taskIndex] ?? "").trim();
         if (!spx || !task) return;
@@ -4277,8 +4854,12 @@ NOL3.pages.planning = function (root) {
       });
 
       incoming.rows.forEach(row => {
+        // Also exclude it if the exception appears in the Incoming Inventory
+        // export. Both datasets therefore participate in the same exclusion.
+        if (rowMatchesPlanningException(row, ih, exceptionSet)) return;
+
         const orderId = norm(row[orderIndex]);
-        if (exceptionSet.has(orderId)) return;
+        if (!orderId) return;
         if (selectedHub && norm(row[destinationIndex]) !== selectedHub) return;
         const tasks = spxToTasks.get(orderId);
         if (!tasks) return;
@@ -4299,11 +4880,16 @@ NOL3.pages.planning = function (root) {
       const triggerText = document.getElementById("incomingLinehaulTriggerText");
       if (!select || !menu || !triggerText) return;
       const taskTownCounts = getIncomingLinehaulTownCounts();
-      const tasks = [...taskTownCounts.keys()].sort((a,b) => a.localeCompare(b));
+      const arrivedTasks = getArrivedIncomingTasks();
+      // Arrived linehauls are already on-floor, so they must no longer appear
+      // as selectable Incoming Linehaul options.
+      const tasks = [...taskTownCounts.keys()]
+        .filter(task => !arrivedTasks.has(String(task || "").trim()))
+        .sort((a,b) => a.localeCompare(b));
 
-      // Keep only linehauls that still exist after an upload/clear.
+      // Keep only linehauls that still exist and are not already arrived.
       selectedIncomingLinehauls = Array.isArray(selectedIncomingLinehauls)
-        ? selectedIncomingLinehauls.filter(v => taskTownCounts.has(v))
+        ? selectedIncomingLinehauls.filter(v => taskTownCounts.has(v) && !arrivedTasks.has(String(v || "").trim()))
         : [];
       selectedIncomingLinehaul = selectedIncomingLinehauls.length === 1 ? selectedIncomingLinehauls[0] : "";
 
@@ -4350,7 +4936,9 @@ NOL3.pages.planning = function (root) {
     const getIncomingTownCounts = () => {
       const taskTownCounts = getIncomingLinehaulTownCounts();
       const result = new Map();
+      const arrived = getArrivedIncomingTasks();
       (selectedIncomingLinehauls || []).forEach(task => {
+        if (arrived.has(String(task || "").trim())) return;
         const counts = taskTownCounts.get(task);
         if (!counts) return;
         counts.forEach((count, town) => result.set(town, (result.get(town) || 0) + Number(count || 0)));
@@ -4550,7 +5138,13 @@ NOL3.pages.planning = function (root) {
 
       const grouped = new Map();
       const rawTownCounts = new Map();
+      const exceptionSet = getPlanningExceptionSet();
+
+      // On-Floor Towns and Total Volume use the same current LM snapshot,
+      // but every row matching an Exception must be removed first.
+      // No CFR1/LH COT/date filtering is introduced here.
       filteredRows.forEach(row => {
+        if (rowMatchesPlanningException(row, headers, exceptionSet)) return;
         const town = parseTownValue(row[townIndex]);
         if (!town) return;
         rawTownCounts.set(town, (rawTownCounts.get(town) || 0) + 1);
@@ -4580,6 +5174,19 @@ NOL3.pages.planning = function (root) {
         });
       }
 
+      // Arrived linehauls add their towns to the On-Floor Towns view only.
+      // They do NOT change Total Volume; the LM snapshot remains the source
+      // of Total Volume. Arrived orders also stop contributing to the Incoming
+      // Orders notification above.
+      const arrivedCounts = getArrivedIncomingTownCounts();
+      arrivedCounts.forEach((count, town) => {
+        if (getOperationalTownDefinitions(town).length) return;
+        if (assignedTowns.has(town)) return;
+        const existing = grouped.get(town) || { town, displayTown: town, baseTown: town, splitArea: '', count: 0, incomingCount: 0 };
+        existing.incomingCount += count;
+        grouped.set(town, existing);
+      });
+
       if (!grouped.size) {
         summary.innerHTML = `<div class="town-empty">No unassigned towns are available for ${NOL3.escapeHTML(hub)}.</div>`;
         updateTownToggleVisibility(false);
@@ -4607,7 +5214,7 @@ NOL3.pages.planning = function (root) {
               <button class="town-zone-toggle" type="button" aria-expanded="false" aria-label="Show Zone IDs for ${NOL3.escapeHTML(item.displayTown)}">▸</button>
               <div class="town-name">${NOL3.escapeHTML(item.displayTown)}</div>
             </div>
-            <div class="town-count-stack"><div class="town-count">${(item.count + (item.incomingCount || 0)).toLocaleString()}</div>${item.incomingCount ? `<div class="town-incoming-count">+${item.incomingCount.toLocaleString()} incoming</div>` : ``}</div>
+            <div class="town-count-stack"><div class="town-count">${(item.count + (item.incomingCount || 0)).toLocaleString()}</div></div>
           </div>`).join("")}
       `;
 
@@ -4669,6 +5276,11 @@ NOL3.pages.planning = function (root) {
         store.byHub = store.byHub && typeof store.byHub === 'object' ? store.byHub : {};
         store.byHub[getPlanningHubKey()] = getPlanningSnapshot();
         NOL3Storage.set(PLANNING_LAYOUT_KEY, JSON.stringify(store));
+        // Town groups / delivery-area arrangements are part of the synced
+        // hub settings channel.
+        window.dispatchEvent(new CustomEvent("planningchanged", {
+          detail: { type: "town-arrangement", source: "local" }
+        }));
       } catch (error) {
         console.warn('NOL3: Could not save planning layout.', error);
       }
@@ -5439,33 +6051,96 @@ NOL3.pages.planning = function (root) {
       const hub = (NOL3.getState && NOL3.getState().selectedHub) || '';
       return `${base}:${String(hub).trim() || '__NO_HUB__'}`;
     };
+    const getFleetProductivityStorageKey = () => {
+      const hub = (NOL3.getState && NOL3.getState().selectedHub) || '';
+      return `${PLANNING_FP_KEY}:${String(hub).trim() || '__NO_HUB__'}`;
+    };
     const getFleetProductivityTarget = () => {
-      try { const value = Number(NOL3Storage.get(PLANNING_FP_KEY)); return Number.isFinite(value) && value > 0 ? value : 50; } catch (error) { return 50; }
+      try {
+        const hubKey = getFleetProductivityStorageKey();
+        const scoped = NOL3Storage.get(hubKey);
+        const value = Number(scoped);
+        if (Number.isFinite(value) && value > 0) return value;
+        // Preserve the existing target once, then future saves are hub-scoped.
+        const legacy = Number(NOL3Storage.get(PLANNING_FP_KEY));
+        return Number.isFinite(legacy) && legacy > 0 ? legacy : 50;
+      } catch (error) { return 50; }
     };
     const saveFleetProductivityTarget = value => {
       const numeric = Number(value); if (!Number.isFinite(numeric) || numeric <= 0) return;
-      try { NOL3Storage.set(PLANNING_FP_KEY, String(numeric)); } catch (error) {}
+      try { NOL3Storage.set(getFleetProductivityStorageKey(), String(numeric)); } catch (error) {}
     };
     const loadPlanningExceptions = () => {
       try { const raw = NOL3Storage.get(getPlanningHubStorageKey(PLANNING_EXCEPTION_KEY)); const parsed = raw ? JSON.parse(raw) : []; return Array.isArray(parsed) ? parsed.map(String).map(v => v.trim()).filter(Boolean) : []; } catch (error) { return []; }
     };
     const savePlanningExceptions = list => { try { NOL3Storage.set(getPlanningHubStorageKey(PLANNING_EXCEPTION_KEY), JSON.stringify(list)); } catch (error) {} };
-    const getPlanningExceptionSet = () => new Set(loadPlanningExceptions().map(value => String(value).replace(/^\uFEFF/, '').trim().toLowerCase()).filter(Boolean));
+    const normalizePlanningExceptionKey = value =>
+      normalizeIncomingKey(String(value ?? '').replace(/^\uFEFF/, ''));
+
+    const getPlanningExceptionSet = () => new Set(
+      loadPlanningExceptions()
+        .map(normalizePlanningExceptionKey)
+        .filter(Boolean)
+    );
+
+    // A single global exclusion test used by EVERY Planning count.
+    // The value entered in Exception is treated as a tracking/order search
+    // term, not as a column-specific value.
+    const planningExceptionValueMatches = (cellValue, exceptionSet) => {
+      if (!exceptionSet?.size) return false;
+
+      const value = normalizePlanningExceptionKey(cellValue);
+      if (!value) return false;
+
+      for (const exception of exceptionSet) {
+        const key = normalizePlanningExceptionKey(exception);
+        if (!key) continue;
+
+        // Exact match is the normal case.
+        if (value === key) return true;
+
+        // Also handle common export formatting where the tracking number is
+        // embedded in a larger cell (quotes, prefixes, suffixes, etc.).
+        // Only allow substring matching for realistic tracking identifiers.
+        if (key.length >= 8 && value.includes(key)) return true;
+      }
+
+      return false;
+    };
+
     const rowMatchesPlanningException = (row, headers, exceptionSet) => {
-      if (!row || !Array.isArray(headers) || !exceptionSet?.size) return false;
-      const candidates = ['order id','spx tn','sls tracking number','sls tracking','tracking number','tracking no','tracking no.','tracking id'];
-      return candidates.some(name => {
-        const index = headers.findIndex(h => String(h ?? '').replace(/^\uFEFF/, '').trim().toLowerCase() === name);
-        if (index < 0) return false;
-        const value = String(row[index] ?? '').replace(/^\uFEFF/, '').trim().toLowerCase();
-        return !!value && exceptionSet.has(value);
+      if (!row || !exceptionSet?.size || !Array.isArray(headers)) return false;
+
+      // Exceptions are tracking/order identifiers. Do NOT search every cell in
+      // the row: operational fields such as Delivery Attempts, Total of On Hold
+      // Times, Reschedule Date, etc. can legitimately contain values like "1".
+      // Searching every cell would therefore exclude unrelated orders when an
+      // operator enters a short tracking value such as 1.
+      const normalizedHeaders = headers.map(h => String(h || '').trim().toLowerCase());
+      const identityNames = [
+        'order id', 'orderid', 'order no', 'order number',
+        'sls tracking number', 'sls tn', 'tracking number', 'tracking no',
+        'tracking id', 'spx tracking number', 'spx tn', 'spx tracking no',
+        'shopee order sn'
+      ];
+      const identityIndexes = [];
+      normalizedHeaders.forEach((header, index) => {
+        if (identityNames.includes(header)) identityIndexes.push(index);
       });
+
+      // If a source has no recognized identifier column, do not fall back to
+      // all cells. That is safer than silently excluding orders because a
+      // numeric operational field happens to equal an exception value.
+      for (const index of identityIndexes) {
+        if (planningExceptionValueMatches(row[index], exceptionSet)) return true;
+      }
+      return false;
     };
     const renderPlanningExceptions = () => {
       const listEl = document.getElementById('planningExceptionList'); const countEl = document.getElementById('planningExceptionCount'); if (!listEl || !countEl) return;
       const list = loadPlanningExceptions(); countEl.textContent = list.length.toLocaleString();
       listEl.innerHTML = list.map((tracking,index) => `<div class="planning-exception-item"><span>${NOL3.escapeHTML(tracking)}</span><button class="planning-exception-remove" type="button" data-exception-index="${index}" aria-label="Remove exception">×</button></div>`).join('');
-      listEl.querySelectorAll('.planning-exception-remove').forEach(button => button.addEventListener('click', () => { const current=loadPlanningExceptions(); const index=Number(button.dataset.exceptionIndex); if(index>=0&&index<current.length){current.splice(index,1);savePlanningExceptions(current);renderPlanningExceptions();renderDeliveryAreas();} }));
+      listEl.querySelectorAll('.planning-exception-remove').forEach(button => button.addEventListener('click', () => { const current=loadPlanningExceptions(); const index=Number(button.dataset.exceptionIndex); if(index>=0&&index<current.length){current.splice(index,1);savePlanningExceptions(current); if(typeof refreshAllExceptionAffectedViews === 'function') refreshAllExceptionAffectedViews(); else { renderPlanningExceptions(); renderDeliveryAreas(); } } }));
     };
     // Parcel Records filter state is mirrored here so Planning > On-Floor
     // can show the filtered parcel volume when the user applies a Parcel Records filter.
@@ -5481,7 +6156,21 @@ NOL3.pages.planning = function (root) {
           totalEl.textContent = parcelCount.toLocaleString();
         } else {
           const counts=townCounts||new Map();
-          totalEl.textContent=[...counts.values()].reduce((sum,count)=>sum+Number(count||0),0).toLocaleString();
+          const lmTotal = [...counts.values()].reduce((sum,count)=>sum+Number(count||0),0);
+
+          // A confirmed-arrived Incoming Linehaul is now physically on-floor,
+          // so its matched orders must be added to Total Volume. Keep this
+          // separate from the LM snapshot so the existing LM calculation is
+          // not altered.
+          let arrivedTotal = 0;
+          try {
+            if (typeof getArrivedIncomingTownCounts === 'function') {
+              const arrivedCounts = getArrivedIncomingTownCounts();
+              arrivedTotal = [...arrivedCounts.values()].reduce((sum,count)=>sum+Number(count||0),0);
+            }
+          } catch (_) { arrivedTotal = 0; }
+
+          totalEl.textContent=(lmTotal + arrivedTotal).toLocaleString();
         }
       }
       if(fpInput&&document.activeElement!==fpInput) fpInput.value=String(getFleetProductivityTarget());
@@ -6004,12 +6693,42 @@ NOL3.pages.planning = function (root) {
     });
 
     const planningFleetProductivity = document.getElementById('planningFleetProductivity');
-    planningFleetProductivity?.addEventListener('change', event => { const value=Number(event.target.value); if(!Number.isFinite(value)||value<=0){event.target.value=String(getFleetProductivityTarget());return;} saveFleetProductivityTarget(value); renderDeliveryAreas(); });
+    planningFleetProductivity?.addEventListener('change', event => {
+      const value=Number(event.target.value);
+      if(!Number.isFinite(value)||value<=0){event.target.value=String(getFleetProductivityTarget());return;}
+      saveFleetProductivityTarget(value);
+      renderDeliveryAreas();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'fleet-productivity',source:'local'}})); } catch (_) {}
+    });
     const planningExceptionInput = document.getElementById('planningExceptionInput');
-    const addPlanningException = () => { const value=String(planningExceptionInput?.value||'').trim(); if(!value)return; const current=loadPlanningExceptions(); if(!current.some(item=>item.toLowerCase()===value.toLowerCase())) current.push(value); savePlanningExceptions(current); if(planningExceptionInput)planningExceptionInput.value=''; renderPlanningExceptions(); renderDeliveryAreas(); renderParcelRecords(); };
+    const refreshAllExceptionAffectedViews = () => {
+      // Planning Exceptions are global: refresh every view that derives an
+      // order count from LM, Incoming Inventory, or the From-To/Linehaul data.
+      renderPlanningExceptions();
+      if (typeof renderIncomingLinehaulSelector === 'function') renderIncomingLinehaulSelector();
+      if (typeof renderIncomingOrders === 'function') renderIncomingOrders();
+      if (typeof updateIncomingOrdersNotification === 'function') updateIncomingOrdersNotification();
+      if (typeof renderDeliveryAreas === 'function') renderDeliveryAreas();
+      if (typeof renderOnFloorTowns === 'function') renderOnFloorTowns();
+      if (typeof renderParcelRecords === 'function') renderParcelRecords();
+    };
+    const addPlanningException = () => {
+      const value=String(planningExceptionInput?.value||'').trim();
+      if(!value)return;
+      const current=loadPlanningExceptions();
+      if(!current.some(item=>item.toLowerCase()===value.toLowerCase())) current.push(value);
+      savePlanningExceptions(current);
+      if(planningExceptionInput)planningExceptionInput.value='';
+      refreshAllExceptionAffectedViews();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'planning-exceptions',source:'local'}})); } catch (_) {}
+    };
     document.getElementById('planningExceptionAdd')?.addEventListener('click',addPlanningException);
     planningExceptionInput?.addEventListener('keydown',event=>{if(event.key==='Enter'){event.preventDefault();addPlanningException();}});
-    document.getElementById('planningExceptionClear')?.addEventListener('click',()=>{savePlanningExceptions([]);renderPlanningExceptions();renderDeliveryAreas();renderParcelRecords();});
+    document.getElementById('planningExceptionClear')?.addEventListener('click',()=>{
+      savePlanningExceptions([]);
+      refreshAllExceptionAffectedViews();
+      try { window.dispatchEvent(new CustomEvent('planningchanged', {detail:{type:'planning-exceptions',source:'local'}})); } catch (_) {}
+    });
 
     loadPlanningLayout();
 
@@ -6028,16 +6747,13 @@ NOL3.pages.planning = function (root) {
         renderDeliveryAreas();
         renderIncomingOrders();
         updateIncomingOrdersNotification();
+        renderPlanningExceptions();
+        const fp = document.getElementById('planningFleetProductivity');
+        if (fp && typeof getFleetProductivityTarget === 'function') fp.value = String(getFleetProductivityTarget());
       }, 0);
     });
 
-    window.addEventListener("businessdatechange", () => {
-      // Business Date changes must refresh the Planning volume without requiring a reload.
-      setTimeout(() => {
-        renderOnFloorTowns();
-        renderDeliveryAreas();
-      }, 0);
-    });
+
 
     const townToggleBtn = document.getElementById("townToggleBtn");
     const townSummary = document.getElementById("onFloorTownSummary");
@@ -6483,10 +7199,17 @@ NOL3.pages.planning = function (root) {
         5: filterValues.parcelFilterCurrent,
         6: filterValues.parcelFilterDestination
       };
-      let records = allRecords.filter(values => Object.entries(activeFilters).every(([col, raw]) => {
-        const list = Array.isArray(raw) ? raw : (raw ? [String(raw)] : []);
-        return !list.length || list.includes(String(values[Number(col)] ?? ''));
-      }));
+      const exceptionSetForParcelRecords = getPlanningExceptionSet();
+      let records = allRecords.filter(values => {
+        // The same global Exception list is applied before ANY Parcel Records
+        // count is calculated.
+        if (rowMatchesPlanningException(values, null, exceptionSetForParcelRecords)) return false;
+
+        return Object.entries(activeFilters).every(([col, raw]) => {
+          const list = Array.isArray(raw) ? raw : (raw ? [String(raw)] : []);
+          return !list.length || list.includes(String(values[Number(col)] ?? ''));
+        });
+      });
       if (query) records = records.filter(values => values.join(' ').toLowerCase().includes(query));
       records.sort((a,b) => String(a[0]).localeCompare(String(b[0])));
 
@@ -7087,6 +7810,22 @@ NOL3.pages.planning = function (root) {
       saveZoneSettingAssignment(town, select.dataset.zoneId || '', select.value || '');
       renderZoneSettings();
     });
+    // Expose the Planning page's closure-scoped renderers so external
+    // Business Date / cloud-restore handlers can refresh the CURRENT DOM.
+    // These functions are intentionally inside the Planning page scope;
+    // calling renderDeliveryAreas() from outside this scope does nothing.
+    NOL3.refreshPlanningViews = function () {
+      try { renderOnFloorTowns(); } catch (_) {}
+      try { renderDeliveryAreas(); } catch (_) {}
+      try { renderIncomingOrders(); } catch (_) {}
+      try { updateIncomingOrdersNotification(); } catch (_) {}
+      try { renderPlanningExceptions(); } catch (_) {}
+      try { renderUnassignedOrders(); } catch (_) {}
+      try { renderParcelRecords(); } catch (_) {}
+      try { renderZoneSettings(); } catch (_) {}
+      try { renderBusinessDayMetrics(); } catch (_) {}
+    };
+
     window.addEventListener('inventoryloaded', event => { if (event.detail?.type === 'lm') { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); } });
     window.addEventListener('inventorycleared', event => { if (event.detail?.type === 'lm') { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); } });
     window.addEventListener('hubchange', () => { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); });
@@ -7244,6 +7983,7 @@ NOL3.pages.riders = function (root) {
         NOL3.readCSVFile(file, (result) => {
           NOL3.riderData = result;
           loadedRiderResult = result;
+          if (window.NOL3RiderHubStore?.save) window.NOL3RiderHubStore.save(result);
           renderRiderData(result);
           if (typeof NOL3.saveUploadedData === "function") {
             NOL3.saveUploadedData("riders", [file]);
@@ -7454,9 +8194,11 @@ NOL3.pages.riders = function (root) {
         </label>
         <label class="topbar-business-field">
           <span class="topbar-business-label">LH COT HOUR</span>
-          <input class="topbar-business-hour" id="businessDayCotHour" type="number" min="0" max="23" step="1" inputmode="numeric" aria-label="Line Haul COT hour" value="14">
+          <input class="topbar-business-hour" id="businessDayCotHour" type="number" min="0" max="23" step="1" inputmode="numeric" aria-label="Line Haul COT hour" value="15">
         </label>
-        <button class="topbar-save-data" id="saveDataBtn" type="button" title="Save the current hub weekly summary as CSV">SAVE DATA</button>
+        <button class="topbar-save-data" id="saveDataBtn" type="button" title="Save current changes and export the weekly summary">SAVE DATA</button>
+        <button class="topbar-save-data" id="clearDataBtn" type="button" title="Clear uploaded files only" style="margin-left:6px;background:#fff;color:#b42318;border:1px solid #f0b7b2;">CLEAR</button>
+        <button class="topbar-save-data" id="refreshAppBtn" type="button" title="Refresh the app" style="margin-left:6px;">REFRESH</button>
         <div class="topbar-business-status" id="businessDayStatus"></div>
       </div>
       <div class="header-badge">NOL3</div>
@@ -7722,13 +8464,68 @@ NOL3.pages.riders = function (root) {
 })();
 
 
+
+/* NOL3 File Store fallback
+ * Android content:// / downloaded HTML files can expose IndexedDB.open() but
+ * fail internally when opening the backing store. The dashboard therefore
+ * uses a memory-backed file store for operational uploads. Supabase remains
+ * the durable cross-device store through NOL3CloudSync.
+ */
+(function () {
+  const records = new Map();
+  const histories = new Map();
+
+  function clone(value) {
+    if (value == null) return value;
+    try { return JSON.parse(JSON.stringify(value)); }
+    catch (_) { return value; }
+  }
+
+  window.NOL3FileStore = {
+    getAll() {
+      return Array.from(records.values()).map(clone);
+    },
+    get(type) {
+      return clone(records.get(String(type)) || null);
+    },
+    put(record) {
+      if (record && record.type) records.set(String(record.type), clone(record));
+    },
+    remove(type) {
+      records.delete(String(type));
+    },
+    putHistory(record) {
+      if (record && record.businessDate) histories.set(String(record.businessDate), clone(record));
+    },
+    getHistory(date) {
+      return clone(histories.get(String(date || '').trim()) || null);
+    },
+    removeHistory(date) {
+      histories.delete(String(date || '').trim());
+    },
+    getHistories() {
+      return Array.from(histories.values()).map(clone);
+    },
+    clearOperational() {
+      records.delete("lm");
+      records.delete("incoming");
+      records.delete("linehaul");
+      records.delete("unifiedInventory");
+      records.delete("unifiedInventoryUndo");
+      histories.clear();
+    }
+  };
+})();
+
+
 (function () {
   // NOL3 Save Data: export a portable backup of the current browser-local data.
   // Includes localStorage plus all records in the uploaded-file IndexedDB store.
   // This is intentionally local-only until the cloud backend is connected.
   const DB_NAME = "NOL3_Planning_Dashboard_DB_DOLORES_ABRA";
-  const DB_VERSION = 2;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
+  const LM_HISTORY_STORE = "lmHistory";
 
   function readLocalStorage() {
     const data = {};
@@ -7807,6 +8604,10 @@ NOL3.pages.riders = function (root) {
         : new Date().toISOString().slice(0, 10);
 
       if (!hub) throw new Error("Select a hub before saving the daily summary.");
+
+      // SAVE DATA is now the explicit cloud-save action. Nothing else writes
+      // local edits to Supabase automatically.
+      if (window.NOL3CloudSync?.syncNow) await window.NOL3CloudSync.syncNow();
 
       const date = new Date(`${businessDate}T00:00:00`);
       const day = date.getDay();
@@ -7926,6 +8727,102 @@ NOL3.pages.riders = function (root) {
     if (!button.disabled && typeof NOL3.saveDataBackup === "function") NOL3.saveDataBackup();
   }, true);
 
+  // Manual Clear: remove uploaded operational files only.
+  // Rider roster, town arrangements, zone settings, planning exceptions, and other hub settings are preserved.
+  const clearAllUploadedFiles = async () => {
+    const clearBtn = document.getElementById("clearDataBtn");
+    if (clearBtn) {
+      clearBtn.disabled = true;
+      clearBtn.textContent = "CLEARING...";
+    }
+
+    try {
+      // Clear every operational upload source, including the persistent
+      // unified-inventory/undo records that could otherwise resurrect data
+      // after a refresh.
+      const clearTypes = ["lm", "incoming", "linehaul"];
+      for (const type of clearTypes) {
+        try { await NOL3.clearUploadedData(type); } catch (_) {}
+      }
+
+      // Remove every browser-local operational record, including ALL LM
+      // history dates. Clearing only today's LM history is not sufficient:
+      // restoreSavedUploads can otherwise resurrect an older saved snapshot
+      // during the next page load.
+      try { NOL3FileStore?.clearOperational?.(); } catch (_) {}
+      try { if (NOL3._inventoryUndoMemory) NOL3._inventoryUndoMemory = null; } catch (_) {}
+
+      NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+      NOL3.incomingInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+      NOL3.lineHaulInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+
+      try { window.dispatchEvent(new CustomEvent("inventorycleared", { detail: { type: "all", source: "manual" } })); } catch (_) {}
+      try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
+      try { if (typeof renderDeliveryAreas === "function") renderDeliveryAreas(); } catch (_) {}
+      try { if (typeof renderIncomingOrders === "function") renderIncomingOrders(); } catch (_) {}
+      try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
+      try { if (typeof renderPlanning === "function") renderPlanning(); } catch (_) {}
+
+      // Write the cleared operational snapshot directly to the files channel.
+      // This is a deliberate user action, so an empty snapshot is valid.
+      // A clearedAt/cledByUser tombstone also prevents the normal startup
+      // merge logic from treating the empty snapshot as missing data.
+      if (window.NOL3CloudSync?.clearUploadedFilesCloud) {
+        await window.NOL3CloudSync.clearUploadedFilesCloud();
+      } else {
+        throw new Error("Cloud sync is not ready. Please wait for CONNECTED • SYNCED before clearing.");
+      }
+
+      alert(
+        "UPLOAD DATA CLEARED\n\n" +
+        "LM Inventory, Incoming Inventory, and Incoming From-To / Linehaul files have been removed.\n\n" +
+        "Your rider data, town arrangements, zone settings, and planning exceptions were NOT changed.\n\n" +
+        "The cleared state has also been saved to the cloud, so refreshing the app will NOT restore the old uploaded files."
+      );
+    } finally {
+      if (clearBtn) {
+        clearBtn.disabled = false;
+        clearBtn.textContent = "CLEAR";
+      }
+    }
+  };
+
+  document.addEventListener("click", function (event) {
+    const button = event.target?.closest?.("#clearDataBtn");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    const confirmed = window.confirm(
+      "CLEAR UPLOADED FILES?\n\n" +
+      "This action will permanently remove the uploaded operational files for Badoc Hub:\n" +
+      "• LM Inventory\n" +
+      "• Incoming Inventory\n" +
+      "• Incoming From-To / Linehaul\n\n" +
+      "It will NOT remove:\n" +
+      "• Rider data\n" +
+      "• Town arrangements\n" +
+      "• Zone settings\n" +
+      "• Planning exceptions\n\n" +
+      "The cleared state will be saved to the cloud and will remain cleared after Refresh.\n\n" +
+      "Are you sure you want to continue?"
+    );
+    if (confirmed) clearAllUploadedFiles().catch(error => {
+      console.error("NOL3: Could not clear uploaded files.", error);
+      alert(`Could not complete Clear: ${error?.message || "unknown error"}`);
+    });
+  }, true);
+
+  // Refresh the app without clearing or changing any saved data.
+  document.addEventListener("click", function (event) {
+    const button = event.target?.closest?.("#refreshAppBtn");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    window.location.reload();
+  }, true);
+
   // Automatic weekly export: on Monday, export the PREVIOUS week's captured
   // daily summaries for the currently selected hub. This is intentionally
   // separate from any future Clear Weekly logic, so clearing cannot mark an
@@ -8033,62 +8930,87 @@ NOL3.pages.riders = function (root) {
 
 (function () {
   const DB_NAME = "NOL3_Planning_Dashboard_DB_DOLORES_ABRA";
-  const DB_VERSION = 2;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
+  const LM_HISTORY_STORE = "lmHistory";
   const TYPES = ["lm", "incoming", "linehaul"];
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      if (!window.indexedDB) {
-        reject(new Error("IndexedDB is not supported in this browser."));
-        return;
-      }
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(STORE)) {
-          db.createObjectStore(STORE, { keyPath: "type" });
-        }
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
-    });
-  }
+  // IndexedDB is intentionally not used here. The app is frequently opened
+  // directly from Android's content://downloads origin, where IndexedDB can
+  // fail with "Internal error opening backing store". The cloud layer provides
+  // durable persistence across devices.
+  const put = async (record) => {
+    if (window.NOL3FileStore) NOL3FileStore.put(record);
+  };
+  const get = async (type) => window.NOL3FileStore ? NOL3FileStore.get(type) : null;
 
-  function put(record) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put(record);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not save uploaded data.")); };
-    }));
-  }
-
-  function get(type) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readonly");
-      const request = tx.objectStore(STORE).get(type);
-      request.onsuccess = () => { const value = request.result; db.close(); resolve(value || null); };
-      request.onerror = () => { db.close(); reject(request.error || new Error("Could not load saved data.")); };
-    }));
-  }
-
-  // Expose storage primitives to the unified-upload module; underlying behavior is unchanged.
   NOL3._storagePut = put;
   NOL3._storageGet = get;
 
+  const LM_HISTORY_PREFIX = "lmHistory::";
+  const getLMHistoryKey = (date) => `${LM_HISTORY_PREFIX}${String(date || "").trim()}`;
+  NOL3.getLMHistoryKey = getLMHistoryKey;
+
+  async function putLMHistory(record) {
+    if (window.NOL3FileStore) NOL3FileStore.putHistory(record);
+  }
+  async function getLMHistoryRecord(businessDate) {
+    return window.NOL3FileStore ? NOL3FileStore.getHistory(businessDate) : null;
+  }
+  async function removeLMHistory(businessDate) {
+    if (window.NOL3FileStore) NOL3FileStore.removeHistory(businessDate);
+  }
+
+  NOL3.saveLMHistorySnapshot = async function (businessDate, dataset, files) {
+    const date = String(businessDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !dataset) return;
+    const list = Array.isArray(files) ? files : [];
+    await putLMHistory({
+      businessDate: date,
+      files: list.map(item => ({
+        name: item?.name || "inventory.csv",
+        lastModified: item?.lastModified || 0,
+        text: typeof item?.text === "string" ? item.text : ""
+      })),
+      dataset: {
+        fileName: dataset.fileName || list.map(item => item?.name || "").filter(Boolean).join(", "),
+        headers: Array.isArray(dataset.headers) ? dataset.headers : [],
+        rows: Array.isArray(dataset.rows) ? dataset.rows : [],
+        rawText: typeof dataset.rawText === "string" ? dataset.rawText : "",
+        loadedAt: dataset.loadedAt || new Date().toISOString()
+      },
+      uploadDate: date,
+      savedAt: new Date().toISOString()
+    });
+  };
+
+  NOL3.getLMHistorySnapshot = async function (businessDate) {
+    const date = String(businessDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+    return getLMHistoryRecord(date);
+  };
+
   function remove(type) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).delete(type);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not clear saved data.")); };
-    }));
+    return Promise.resolve().then(() => {
+      if (window.NOL3FileStore) NOL3FileStore.remove(type);
+    });
   }
 
   NOL3.clearUploadedData = async function (type) {
     if (!TYPES.includes(type)) return;
-    await remove(type);
+    if (type === "lm") {
+      try {
+        const selectedDate = typeof NOL3.getBusinessDateValue === "function"
+          ? NOL3.getBusinessDateValue()
+          : String(NOL3.currentBusinessDate || "").trim();
+        if (/^\d{4}-\d{2}-\d{2}$/.test(selectedDate)) await removeLMHistory(selectedDate);
+      } catch (error) {
+        console.warn("NOL3: Could not clear date-specific LM history.", error);
+      }
+      await remove(type);
+    } else {
+      await remove(type);
+    }
     if (type === "lm") {
       NOL3.lmInventory = { files: [], rows: [], filteredRows: [] };
       const lmStatus = document.getElementById("lmFilterStatus");
@@ -8178,6 +9100,36 @@ NOL3.pages.riders = function (root) {
     }
   };
 
+  // Rider roster is hub-specific. Keep a local copy keyed by hub so changing
+  // hubs or refreshing the page never forces the user to upload the same rider
+  // file again. The Supabase roster channel is also hub-specific because each
+  // hub writes to its own hub_data row.
+  const RIDER_HUB_STORE_KEY = "nol3_rider_data_by_hub_v1";
+  const getRiderHubStore = () => parseObject(NOL3Storage.get(RIDER_HUB_STORE_KEY), {});
+  const getCurrentHubName = () => String((NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME || "").trim();
+  const saveRiderDataForHub = (result, hub = getCurrentHubName()) => {
+    if (!result || !hub) return;
+    try {
+      const store = getRiderHubStore();
+      store[hub] = {
+        fileName: result.fileName || "",
+        headers: Array.isArray(result.headers) ? result.headers : [],
+        rows: Array.isArray(result.rows) ? result.rows : [],
+        rawText: typeof result.rawText === "string" ? result.rawText : "",
+        loadedAt: result.loadedAt || new Date().toISOString(),
+        rowCount: Array.isArray(result.rows) ? result.rows.length : Number(result.rowCount || 0)
+      };
+      NOL3Storage.set(RIDER_HUB_STORE_KEY, JSON.stringify(store));
+    } catch (_) {}
+  };
+  const loadRiderDataForHub = (hub = getCurrentHubName()) => {
+    if (!hub) return null;
+    const store = getRiderHubStore();
+    const value = store[hub];
+    return value && typeof value === "object" ? value : null;
+  };
+  window.NOL3RiderHubStore = { save: saveRiderDataForHub, load: loadRiderDataForHub };
+
   NOL3.saveUploadedData = async function (type, files, dataset = null) {
     try {
       const list = Array.isArray(files) ? files : [files];
@@ -8187,11 +9139,48 @@ NOL3.pages.riders = function (root) {
         const text = typeof file.text === 'function' ? await file.text() : String(file.text || '');
         records.push({ name: file.name, lastModified: file.lastModified || 0, text });
       }
-      const previous = await get(type);
-      const existingFiles = Array.isArray(previous?.files) ? previous.files : [];
-      const allFiles = [...existingFiles, ...records].filter((item, index, arr) =>
-        arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
-      );
+      // LM data is a daily snapshot. Every upload is saved under the actual
+      // Philippines calendar date on which the file was uploaded. A later
+      // upload on the same date replaces/updates that day's snapshot, while
+      // snapshots from previous dates remain untouched.
+      let allFiles;
+      if (type === "lm") {
+        const today = (typeof getNOL3TodayDate === "function")
+          ? getNOL3TodayDate()
+          : new Date().toISOString().slice(0, 10);
+
+        // Keep the cumulative file list for today's snapshot. The rows in
+        // dataset are already the merged/stacked rows.
+        let previousTodayFiles = [];
+        try {
+          const previousToday = await NOL3.getLMHistorySnapshot(today);
+          previousTodayFiles = Array.isArray(previousToday?.files)
+            ? previousToday.files
+            : [];
+        } catch (_) {}
+
+        allFiles = [...previousTodayFiles, ...records].filter((item, index, arr) =>
+          arr.findIndex(x =>
+            x.name === item.name &&
+            (x.lastModified || 0) === (item.lastModified || 0)
+          ) === index
+        );
+
+        if (dataset) {
+          const historyDataset = {
+            ...dataset,
+            fileName: dataset.fileName || allFiles.map(item => item.name).join(', '),
+            loadedAt: dataset.loadedAt || new Date().toISOString()
+          };
+          await NOL3.saveLMHistorySnapshot(today, historyDataset, allFiles);
+        }
+      } else {
+        const previous = await get(type);
+        const existingFiles = Array.isArray(previous?.files) ? previous.files : [];
+        allFiles = [...existingFiles, ...records].filter((item, index, arr) =>
+          arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
+        );
+      }
       const record = { type, files: allFiles, savedAt: new Date().toISOString() };
       if (dataset) {
         record.dataset = {
@@ -8208,38 +9197,96 @@ NOL3.pages.riders = function (root) {
     }
   };
 
+  NOL3.loadLMHistoryForDate = async function (businessDate) {
+    const date = String(businessDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return null;
+
+    const saved = await NOL3.getLMHistorySnapshot(date);
+    if (saved?.dataset && Array.isArray(saved.dataset.rows)) {
+      const d = saved.dataset;
+      NOL3.lmInventory = {
+        files: Array.isArray(saved.files) ? saved.files.map(item => ({ name: item.name, lastModified: item.lastModified || 0 })) : [],
+        fileName: d.fileName || (saved.files || []).map(item => item.name).join(', '),
+        headers: Array.isArray(d.headers) ? d.headers : [],
+        rows: d.rows,
+        filteredRows: [],
+        loadedAt: d.loadedAt || saved.savedAt || new Date().toISOString()
+      };
+      filterLMForHub(NOL3.lmInventory);
+      window.dispatchEvent(new CustomEvent("inventoryloaded", {
+        detail: { type: "lm", fileName: NOL3.lmInventory.fileName, totalRows: NOL3.lmInventory.rows.length, businessDate: date, historical: true }
+      }));
+      return NOL3.lmInventory;
+    }
+
+    // No upload exists for this date: do not display another day's snapshot.
+    NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: new Date().toISOString() };
+    window.dispatchEvent(new CustomEvent("inventoryloaded", {
+      detail: { type: "lm", fileName: "", totalRows: 0, businessDate: date, historical: true, empty: true }
+    }));
+    return NOL3.lmInventory;
+  };
+
   NOL3.restoreSavedUploads = async function () {
     try {
       const savedLM = await get("lm");
-      if (savedLM && Array.isArray(savedLM.files) && savedLM.files.length) {
-        const result = savedLM.dataset && Array.isArray(savedLM.dataset.rows)
-          ? {
-              files: savedLM.files.map(item => ({ name: item.name, lastModified: item.lastModified || 0 })),
-              fileName: savedLM.dataset.fileName || savedLM.files.map(item => item.name).join(', '),
-              headers: Array.isArray(savedLM.dataset.headers) ? savedLM.dataset.headers : [],
-              rows: savedLM.dataset.rows,
-              filteredRows: [],
-              loadedAt: savedLM.dataset.loadedAt || savedLM.savedAt || new Date().toISOString()
-            }
-          : buildLMResult(savedLM.files);
+      const selectedBusinessDate = typeof NOL3.getBusinessDateValue === "function"
+        ? NOL3.getBusinessDateValue()
+        : String(NOL3.currentBusinessDate || "").trim();
+
+      // Prefer the date-specific LM snapshot. If this is the first startup after
+      // the daily-history change and only the legacy single snapshot exists,
+      // migrate that snapshot to today's history key once.
+      let historySnapshot = await NOL3.getLMHistorySnapshot(selectedBusinessDate);
+      if (!historySnapshot && savedLM && savedLM.dataset && Array.isArray(savedLM.dataset.rows)) {
+        const today = (typeof getNOL3TodayDate === "function") ? getNOL3TodayDate() : new Date().toISOString().slice(0, 10);
+        if (selectedBusinessDate === today) {
+          await NOL3.saveLMHistorySnapshot(today, savedLM.dataset, savedLM.files || []);
+          historySnapshot = await NOL3.getLMHistorySnapshot(today);
+        }
+      }
+
+      if (historySnapshot?.dataset && Array.isArray(historySnapshot.dataset.rows)) {
+        const d = historySnapshot.dataset;
+        const result = {
+          files: Array.isArray(historySnapshot.files) ? historySnapshot.files.map(item => ({ name: item.name, lastModified: item.lastModified || 0 })) : [],
+          fileName: d.fileName || (historySnapshot.files || []).map(item => item.name).join(', '),
+          headers: Array.isArray(d.headers) ? d.headers : [],
+          rows: d.rows,
+          filteredRows: [],
+          loadedAt: d.loadedAt || historySnapshot.savedAt || new Date().toISOString()
+        };
         filterLMForHub(result);
         NOL3.lmInventory = result;
         window.dispatchEvent(new CustomEvent("inventoryloaded", {
-          detail: { type: "lm", fileName: result.fileName, totalRows: result.rows.length, headers: result.headers }
+          detail: { type: "lm", fileName: result.fileName, totalRows: result.rows.length, headers: result.headers, businessDate: selectedBusinessDate, historical: true }
+        }));
+      } else {
+        NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: new Date().toISOString() };
+        window.dispatchEvent(new CustomEvent("inventoryloaded", {
+          detail: { type: "lm", fileName: "", totalRows: 0, headers: [], businessDate: selectedBusinessDate, historical: true, empty: true }
         }));
       }
 
-      const savedRiders = await get("riders");
-      if (savedRiders && Array.isArray(savedRiders.files) && savedRiders.files[0]) {
-        const item = savedRiders.files[0];
-        const text = item.text || "";
-        const rows = text.split(/\r?\n/).filter(row => row.trim() !== "");
-        NOL3.riderData = {
-          fileName: item.name,
-          rowCount: Math.max(0, rows.length - 1),
-          rawText: text,
-          rows
-        };
+      // Restore riders for the selected hub first. Fall back to the legacy
+      // single-roster store once, then migrate it into the hub-specific store.
+      const riderHubData = window.NOL3RiderHubStore?.load?.((NOL3.getState && NOL3.getState().selectedHub) || "");
+      if (riderHubData && (Array.isArray(riderHubData.rows) || riderHubData.rawText)) {
+        NOL3.riderData = riderHubData;
+      } else {
+        const savedRiders = await get("riders");
+        if (savedRiders && Array.isArray(savedRiders.files) && savedRiders.files[0]) {
+          const item = savedRiders.files[0];
+          const text = item.text || "";
+          const rows = text.split(/\r?\n/).filter(row => row.trim() !== "");
+          NOL3.riderData = {
+            fileName: item.name,
+            rowCount: Math.max(0, rows.length - 1),
+            rawText: text,
+            rows
+          };
+          window.NOL3RiderHubStore?.save?.(NOL3.riderData);
+        }
       }
 
       const savedUnified = await get("unifiedInventory");
@@ -8252,11 +9299,19 @@ NOL3.pages.riders = function (root) {
           loadedAt: d.loadedAt || savedUnified.savedAt || new Date().toISOString(),
           rawText: typeof d.rawText === "string" ? d.rawText : (savedUnified.files?.[0]?.text || "")
         };
-        NOL3.lmInventory = { ...resultBase, rows: Array.isArray(d.lmRows) ? d.lmRows : [], filteredRows: [], rowCount: Array.isArray(d.lmRows) ? d.lmRows.length : 0, files: savedUnified.files || [] };
+
+        // A dedicated LM upload is the current LM snapshot. Do not replace it
+        // with the older cumulative Unified Inventory snapshot during startup.
+        // Unified Inventory still restores Incoming data and remains available
+        // when no dedicated LM snapshot exists.
+        const hasDedicatedLM = !!(savedLM && Array.isArray(savedLM.dataset?.rows));
+        if (!hasDedicatedLM) {
+          NOL3.lmInventory = { ...resultBase, rows: Array.isArray(d.lmRows) ? d.lmRows : [], filteredRows: [], rowCount: Array.isArray(d.lmRows) ? d.lmRows.length : 0, files: savedUnified.files || [] };
+          filterLMForHub(NOL3.lmInventory);
+          window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", data: NOL3.lmInventory } }));
+        }
         NOL3.incomingInventory = { ...resultBase, rows: Array.isArray(d.incomingRows) ? d.incomingRows : [], filteredRows: [], rowCount: Array.isArray(d.incomingRows) ? d.incomingRows.length : 0, files: savedUnified.files || [] };
-        filterLMForHub(NOL3.lmInventory);
         restoredUnified = true;
-        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", data: NOL3.lmInventory } }));
         window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", data: NOL3.incomingInventory } }));
       }
 
@@ -8338,7 +9393,7 @@ NOL3.pages.riders = function (root) {
 
     reader.onload = function (event) {
       // Strip NUL (\u0000) characters: they can end up here if a binary file
-      // (e.g. a mis-saved .xlsx) gets read as text, and Postgres/Supabase's
+      // (e.g. a mis-saved .xlsx) gets read as text, and the database layer's
       // jsonb columns reject \u0000 outright ("unsupported Unicode escape
       // sequence"), which breaks cloud sync for the whole snapshot.
       const text = String(event.target.result || "").replace(/\u0000/g, "");
@@ -8397,6 +9452,9 @@ NOL3.pages.riders = function (root) {
       window.dispatchEvent(new CustomEvent("inventoryloaded", {
         detail: { type: "incoming", data: result }
       }));
+      // Push the complete Incoming Orders source data immediately. This avoids
+      // relying only on the 5-second polling loop after a large CSV upload.
+      try { if (window.NOL3CloudSync?.syncNow) window.NOL3CloudSync.syncNow(); } catch (_) {}
       console.log("Incoming Inventory loaded:", result.fileName, result.rowCount, "data rows");
     });
   };
@@ -8410,39 +9468,123 @@ NOL3.pages.riders = function (root) {
       NOL3.lineHaulInventory = result;
       NOL3.saveUploadedData("linehaul", [file], result);
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "linehaul", data: result } }));
+      // The Incoming Orders screen requires both datasets: Incoming Inventory
+      // and the Incoming Inventory From-To/Linehaul list. Push immediately so
+      // another device receives the linehaul mapping as well.
+      try { if (window.NOL3CloudSync?.syncNow) window.NOL3CloudSync.syncNow(); } catch (_) {}
       console.log("Line Haul Task ID file loaded:", result.fileName, result.rowCount, "data rows");
     });
   };
 })();
 
 
-// HARD Business Date persistence guard. This runs in capture phase so it
-// commits the date before any navigation handler can rebuild the UI.
+// HARD Business Date persistence guard. This runs in capture phase so the
+// selected date is committed even on mobile browsers where the native date
+// picker can rebuild/blur the control before the page's local handler runs.
 (function () {
   const valid = v => /^\d{4}-\d{2}-\d{2}$/.test(String(v || "").trim());
-  const sync = () => {
+  const sync = (rerender = false) => {
     const input = document.getElementById("businessDayDate");
     if (!input || !valid(input.value)) return;
     const value = String(input.value).trim();
     NOL3.currentBusinessDate = value;
     try { NOL3Storage.set("nol3_business_day_date_v1", value); } catch (_) {}
+    if (rerender) {
+      window.dispatchEvent(new CustomEvent("businessdatechange", { detail: { businessDate: value, source: "picker" } }));
+    }
   };
 
   document.addEventListener("input", event => {
-    if (event.target?.id === "businessDayDate") sync();
+    if (event.target?.id === "businessDayDate") sync(false);
   }, true);
   document.addEventListener("change", event => {
-    if (event.target?.id === "businessDayDate") sync();
+    if (event.target?.id === "businessDayDate") sync(true);
   }, true);
   document.addEventListener("blur", event => {
-    if (event.target?.id === "businessDayDate") sync();
+    if (event.target?.id === "businessDayDate") sync(false);
   }, true);
   document.addEventListener("pointerdown", event => {
-    if (event.target?.closest?.(".nav-item")) sync();
+    if (event.target?.closest?.(".nav-item")) sync(false);
   }, true);
   document.addEventListener("click", event => {
-    if (event.target?.closest?.(".nav-item")) sync();
+    if (event.target?.closest?.(".nav-item")) sync(false);
   }, true);
+})();
+
+// When the Business Date changes, switch the active LM dataset to the snapshot
+// uploaded on that calendar date. This is what keeps yesterday's upload in
+// yesterday and today's upload in today.
+(function () {
+  let switching = false;
+  window.addEventListener("businessdatechange", async event => {
+    const date = String(event.detail?.businessDate || NOL3.currentBusinessDate || "").trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || switching) return;
+    if (typeof NOL3.loadLMHistoryForDate !== "function") return;
+    switching = true;
+    try {
+      // NOW loads the snapshot before dispatching this event. Do not start a
+      // second IndexedDB read in that case; doing so created a race where the
+      // first click rendered an empty dataset and the second click appeared to
+      // fix it. Normal date-picker changes still load here.
+      if (!event.detail?.lmAlreadyLoaded) {
+        await NOL3.loadLMHistoryForDate(date);
+      }
+
+      // loadLMHistoryForDate() already rebuilds filteredRows. Do not repeat
+      // the full row filter here; doing it again on large LM files was a major
+      // source of date-switch lag.
+      if (typeof NOL3.updateInventoryUploadSummaries === "function") {
+        try { await NOL3.updateInventoryUploadSummaries(); } catch (_) {}
+      }
+
+      // Refresh only the views that depend on the dated LM dataset. Avoid a
+      // full renderPage() because rebuilding the entire DOM can be expensive
+      // with large uploads and was unnecessary for a date switch.
+      const renderAfterDateRestore = () => {
+        if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+        if (typeof renderOnFloorTowns === "function") renderOnFloorTowns();
+        if (typeof renderDeliveryAreas === "function") renderDeliveryAreas();
+        if (typeof renderIncomingOrders === "function") renderIncomingOrders();
+        if (typeof updateIncomingOrdersNotification === "function") updateIncomingOrdersNotification();
+        if (typeof renderPlanningExceptions === "function") renderPlanningExceptions();
+        if (typeof renderUnassignedOrders === "function") renderUnassignedOrders();
+        if (typeof renderParcelRecords === "function") renderParcelRecords();
+      };
+      // Rebuild the active page once after the dated snapshot is fully loaded.
+      // The metric elements can be recreated by the page renderer; updating
+      // only the old DOM nodes is why the data sometimes appeared only after
+      // a manual Refresh. This is still much cheaper than a full app reload.
+      try {
+        const currentPage = NOL3.state?.currentPage || "planning";
+        if (typeof NOL3.renderPage === "function") NOL3.renderPage(currentPage);
+      } catch (_) {}
+
+      // renderPage() recreates the Planning DOM, so the closure-scoped
+      // Planning renderers must run AFTER that rebuild. Use the exported
+      // refresh hook rather than trying to call those local functions from
+      // this outer scope.
+      const refreshCurrentPlanningDOM = () => {
+        try {
+          if (typeof NOL3.refreshPlanningViews === "function") {
+            NOL3.refreshPlanningViews();
+            return;
+          }
+        } catch (_) {}
+        renderAfterDateRestore();
+      };
+      refreshCurrentPlanningDOM();
+      requestAnimationFrame(() => {
+        refreshCurrentPlanningDOM();
+        requestAnimationFrame(refreshCurrentPlanningDOM);
+        setTimeout(refreshCurrentPlanningDOM, 100);
+        setTimeout(refreshCurrentPlanningDOM, 500);
+      });
+    } catch (error) {
+      console.warn("NOL3: Could not switch LM snapshot for Business Date.", error);
+    } finally {
+      switching = false;
+    }
+  });
 })();
 
 // Global LM restore hook. Dashboard must refresh when saved LM data arrives;
@@ -8451,8 +9593,10 @@ NOL3.pages.riders = function (root) {
   const refresh = () => {
     if (typeof NOL3.renderBusinessDayMetrics !== "function") return;
     NOL3.renderBusinessDayMetrics();
-    setTimeout(() => NOL3.renderBusinessDayMetrics(), 0);
-    setTimeout(() => NOL3.renderBusinessDayMetrics(), 100);
+    requestAnimationFrame(() => NOL3.renderBusinessDayMetrics());
+    setTimeout(() => {
+      if (typeof NOL3.renderBusinessDayMetrics === "function") NOL3.renderBusinessDayMetrics();
+    }, 50);
   };
   window.addEventListener("inventoryloaded", event => {
     if (event.detail?.type === "lm") refresh();
@@ -8529,13 +9673,16 @@ NOL3.pages.riders = function (root) {
         }
       }
 
-      // On every startup/refresh, the Dashboard should use today's Philippine
-      // business date automatically. Do this before rendering the cards.
-      const startupToday = (typeof getNOL3TodayDate === "function")
-        ? getNOL3TodayDate()
-        : new Date().toISOString().slice(0, 10);
-      NOL3.currentBusinessDate = startupToday;
-      try { NOL3Storage.set("nol3_business_day_date_v1", startupToday); } catch (_) {}
+      // Preserve the Business Date selected by the user.
+      // getBusinessDateValue() uses the saved date when one exists and only
+      // falls back to today when no Business Date has ever been set.
+      // Do NOT overwrite it with today's date on every startup/LM restore.
+      const activeBusinessDate = (typeof getBusinessDateValue === "function")
+        ? getBusinessDateValue()
+        : (window.NOL3InitialBusinessDate || "");
+      if (/^\d{4}-\d{2}-\d{2}$/.test(String(activeBusinessDate || ""))) {
+        NOL3.currentBusinessDate = activeBusinessDate;
+      }
 
       NOL3.renderTopbar();
       NOL3.renderPage(NOL3.getState().currentPage);
@@ -8669,6 +9816,40 @@ NOL3.pages.riders = function (root) {
 
 
 <script>
+/* Badoc Hub local-only mode.
+ * Cloud synchronization has been removed.
+ * Local IndexedDB/localStorage data and all existing dashboard features remain.
+ */
+(function () {
+  const HUB_NAME = "Dolores-Abra Hub";
+
+  window.addEventListener("load", function () {
+    setTimeout(() => {
+      try {
+        if (window.NOL3?.state) NOL3.state.selectedHub = HUB_NAME;
+        if (window.NOL3Storage?.set) NOL3Storage.set("nol3_selected_hub", HUB_NAME);
+        if (typeof NOL3?.renderTopbar === "function") NOL3.renderTopbar();
+
+        const label = document.getElementById("hubPickerLabel");
+        const picker = document.getElementById("hubPickerBtn");
+        if (label) label.textContent = HUB_NAME;
+        if (picker) {
+          picker.disabled = true;
+          picker.setAttribute("aria-disabled", "true");
+          picker.style.cursor = "default";
+        }
+        if (typeof NOL3?.renderPage === "function") {
+          NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        }
+      } catch (e) {
+        console.warn("NOL3: Could not lock Dolores-Abra Hub UI", e);
+      }
+    }, 1200);
+  });
+})();
+</script>
+
+<script>
 /* NOL3 Cloud Sync — Dolores-Abra Hub
  * Simple device-to-device synchronization through Supabase.
  * This intentionally uses the Supabase publishable key in the browser.
@@ -8680,7 +9861,7 @@ NOL3.pages.riders = function (root) {
   const HUB_NAME = "Dolores-Abra Hub";
   const HUB_CODE = "DOLORES_ABRA";
   const DB_NAME = "NOL3_Planning_Dashboard_DB_DOLORES_ABRA";
-  const DB_VERSION = 2;
+  const DB_VERSION = 4;
   const STORE = "uploadedFiles";
 
   // Three independent sync "channels", all sharing the same hub_data table
@@ -8735,39 +9916,160 @@ NOL3.pages.riders = function (root) {
     pollMs: 5000,
     debounceMs: 1200,
     async buildSnapshot() {
-      const all = await readIndexedDB();
+      const rider = window.NOL3?.riderData || null;
       return {
-        version: 1,
+        version: 2,
         hubId: HUB_ID,
         hubName: HUB_NAME,
         hubCode: HUB_CODE,
         clientUpdatedAt: rosterChannel.lastLocalMutationAt || Number(localStorage.getItem(rosterChannel.metaKey) || 0),
-        indexedDB: all.filter(record => record && record.type === "riders")
+        riderData: rider ? {
+          fileName: rider.fileName || "",
+          headers: Array.isArray(rider.headers) ? rider.headers : [],
+          rows: Array.isArray(rider.rows) ? rider.rows : [],
+          rawText: typeof rider.rawText === "string" ? rider.rawText : "",
+          loadedAt: rider.loadedAt || ""
+        } : null
       };
     },
     async applyRemote(data) {
-      await restoreIndexedDB(data.indexedDB);
+      if (!data || !data.riderData) return;
+      NOL3.riderData = data.riderData;
+      window.NOL3RiderHubStore?.save?.(data.riderData, (NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME);
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "cloud" } }));
+      if (NOL3.state?.currentPage === "riders" && typeof NOL3.renderPage === "function") {
+        NOL3.renderPage("riders");
+      }
     }
   });
 
   const filesChannel = makeChannel({
     dataType: "app_state_files",
     metaKey: "NOL3_CLOUD_LAST_APPLIED_DOLORES_ABRA_FILES",
-    pollMs: 60000,
-    debounceMs: 8000,
+    pollMs: 5000,
+    debounceMs: 3000,
     async buildSnapshot() {
-      const all = await readIndexedDB();
+      const lm = window.NOL3?.lmInventory || null;
+      const incoming = window.NOL3?.incomingInventory || null;
+      const linehaul = window.NOL3?.lineHaulInventory || null;
       return {
-        version: 1,
+        version: 4,
         hubId: HUB_ID,
         hubName: HUB_NAME,
         hubCode: HUB_CODE,
         clientUpdatedAt: filesChannel.lastLocalMutationAt || Number(localStorage.getItem(filesChannel.metaKey) || 0),
-        indexedDB: all.filter(record => !(record && record.type === "riders"))
+        lmInventory: lm ? {
+          fileName: lm.fileName || "",
+          files: Array.isArray(lm.files) ? lm.files : [],
+          headers: Array.isArray(lm.headers) ? lm.headers : [],
+          rows: Array.isArray(lm.rows) ? lm.rows : [],
+          filteredRows: Array.isArray(lm.filteredRows) ? lm.filteredRows : [],
+          rawText: typeof lm.rawText === "string" ? lm.rawText : "",
+          loadedAt: lm.loadedAt || ""
+        } : null,
+        incomingInventory: incoming ? {
+          fileName: incoming.fileName || "",
+          files: Array.isArray(incoming.files) ? incoming.files : [],
+          headers: Array.isArray(incoming.headers) ? incoming.headers : [],
+          rows: Array.isArray(incoming.rows) ? incoming.rows : [],
+          rawText: typeof incoming.rawText === "string" ? incoming.rawText : "",
+          loadedAt: incoming.loadedAt || ""
+        } : null,
+        // Incoming Orders are matched by SPX tracking number against the
+        // Incoming From-To / Linehaul export. Sync that second dataset too;
+        // without it another device has Incoming Inventory but cannot build
+        // the Incoming Orders list.
+        lineHaulInventory: linehaul ? {
+          fileName: linehaul.fileName || "",
+          files: Array.isArray(linehaul.files) ? linehaul.files : [],
+          headers: Array.isArray(linehaul.headers) ? linehaul.headers : [],
+          rows: Array.isArray(linehaul.rows) ? linehaul.rows : [],
+          rawText: typeof linehaul.rawText === "string" ? linehaul.rawText : "",
+          loadedAt: linehaul.loadedAt || ""
+        } : null,
+        arrivedIncomingTasks: (() => {
+          try {
+            const raw = NOL3Storage.get("nol3_incoming_arrived_tasks_v1");
+            const parsed = JSON.parse(raw || "[]");
+            return Array.isArray(parsed)
+              ? parsed.map(v => String(v || "").trim()).filter(Boolean)
+              : [];
+          } catch (_) { return []; }
+        })()
       };
     },
     async applyRemote(data) {
-      await restoreIndexedDB(data.indexedDB);
+      if (!data) return;
+      filesChannel.lastRemoteClearedByUser = data.clearedByUser === true;
+
+      if (data.lmInventory) {
+        const lm = data.lmInventory;
+        NOL3.lmInventory = {
+          fileName: lm.fileName || "",
+          files: Array.isArray(lm.files) ? lm.files : [],
+          headers: Array.isArray(lm.headers) ? lm.headers : [],
+          rows: Array.isArray(lm.rows) ? lm.rows : [],
+          filteredRows: Array.isArray(lm.filteredRows) ? lm.filteredRows : [],
+          loadedAt: lm.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(lm.rows) ? lm.rows.length : 0,
+          rawText: typeof lm.rawText === "string" ? lm.rawText : ""
+        };
+        if (typeof filterLMForHub === "function") {
+          filterLMForHub(NOL3.lmInventory);
+          // Prefer the cloud-derived filtered snapshot when it is present.
+          if (Array.isArray(lm.filteredRows)) NOL3.lmInventory.filteredRows = lm.filteredRows;
+        }
+      }
+
+      if (data.incomingInventory) {
+        const incoming = data.incomingInventory;
+        NOL3.incomingInventory = {
+          fileName: incoming.fileName || "",
+          files: Array.isArray(incoming.files) ? incoming.files : [],
+          headers: Array.isArray(incoming.headers) ? incoming.headers : [],
+          rows: Array.isArray(incoming.rows) ? incoming.rows : [],
+          filteredRows: [],
+          loadedAt: incoming.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(incoming.rows) ? incoming.rows.length : 0,
+          rawText: typeof incoming.rawText === "string" ? incoming.rawText : ""
+        };
+      }
+
+      if (data.lineHaulInventory) {
+        const linehaul = data.lineHaulInventory;
+        NOL3.lineHaulInventory = {
+          fileName: linehaul.fileName || "",
+          files: Array.isArray(linehaul.files) ? linehaul.files : [],
+          headers: Array.isArray(linehaul.headers) ? linehaul.headers : [],
+          rows: Array.isArray(linehaul.rows) ? linehaul.rows : [],
+          loadedAt: linehaul.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(linehaul.rows) ? linehaul.rows.length : 0,
+          rawText: typeof linehaul.rawText === "string" ? linehaul.rawText : ""
+        };
+      }
+
+      // Confirmed Incoming Linehaul arrivals are part of the Planning
+      // calculation. Restore them together with inventory so Total Volume and
+      // Town counts match across devices.
+      if (Array.isArray(data.arrivedIncomingTasks)) {
+        try {
+          NOL3Storage.set(
+            "nol3_incoming_arrived_tasks_v1",
+            JSON.stringify(data.arrivedIncomingTasks)
+          );
+        } catch (_) {}
+      }
+
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", source: "cloud" } }));
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", source: "cloud" } }));
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "linehaul", source: "cloud" } }));
+
+      try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
+      try { if (typeof renderOnFloorTowns === "function") renderOnFloorTowns(); } catch (_) {}
+      try { if (typeof renderDeliveryAreas === "function") renderDeliveryAreas(); } catch (_) {}
+      try { if (typeof renderIncomingOrders === "function") renderIncomingOrders(); } catch (_) {}
+      try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
+      try { if (typeof renderParcelRecords === "function") renderParcelRecords(); } catch (_) {}
     }
   });
 
@@ -8809,39 +10111,14 @@ NOL3.pages.riders = function (root) {
     return text ? JSON.parse(text) : null;
   };
 
-  function openDB() {
-    return new Promise((resolve, reject) => {
-      if (!window.indexedDB) return resolve(null);
-      const request = indexedDB.open(DB_NAME, DB_VERSION);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error || new Error("Could not open IndexedDB."));
-    });
-  }
-
   function readIndexedDB() {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      if (!db) return resolve([]);
-      if (!db.objectStoreNames.contains(STORE)) { db.close(); return resolve([]); }
-      const tx = db.transaction(STORE, "readonly");
-      const req = tx.objectStore(STORE).getAll();
-      req.onsuccess = () => {
-        const records = Array.isArray(req.result) ? req.result : [];
-        db.close();
-        resolve(records);
-      };
-      req.onerror = () => { db.close(); reject(req.error || new Error("Could not read IndexedDB.")); };
-    }));
+    return Promise.resolve(window.NOL3FileStore ? NOL3FileStore.getAll() : []);
   }
 
   function putIndexedDB(record) {
-    return openDB().then(db => new Promise((resolve, reject) => {
-      if (!db) return resolve();
-      if (!db.objectStoreNames.contains(STORE)) { db.close(); return resolve(); }
-      const tx = db.transaction(STORE, "readwrite");
-      tx.objectStore(STORE).put(record);
-      tx.oncomplete = () => { db.close(); resolve(); };
-      tx.onerror = () => { db.close(); reject(tx.error || new Error("Could not restore IndexedDB.")); };
-    }));
+    return Promise.resolve().then(() => {
+      if (window.NOL3FileStore && record && record.type) NOL3FileStore.put(record);
+    });
   }
 
   function parseObject(raw, fallback) {
@@ -8857,12 +10134,15 @@ NOL3.pages.riders = function (root) {
     const exceptionStore = parseObject(NOL3Storage.get("nol3_planning_exceptions_v1:" + hub), []);
     const overrideStore = parseObject(NOL3Storage.get("nol3_zone_id_overrides_v1"), {});
     const zoneSettingsStore = parseObject(NOL3Storage.get("nol3_zone_settings_v1"), {});
+    const planningByHub = layoutStore?.byHub && typeof layoutStore.byHub === "object"
+      ? layoutStore.byHub
+      : layoutStore;
 
     return {
       businessDate: NOL3Storage.get("nol3_business_day_date_v1") || "",
       businessDaySettings: NOL3Storage.get("nol3_business_day_settings_v1") || "",
-      planningLayout: layoutStore[hub] || null,
-      fleetProductivity: NOL3Storage.get("nol3_fleet_productivity_v1") || "",
+      planningLayout: planningByHub?.[hub] || null,
+      fleetProductivity: NOL3Storage.get("nol3_fleet_productivity_v1:" + hub) || NOL3Storage.get("nol3_fleet_productivity_v1") || "",
       planningExceptions: exceptionStore,
       zoneOverrides: overrideStore[hub] || {},
       zoneSettings: zoneSettingsStore[hub] || {},
@@ -8878,15 +10158,22 @@ NOL3.pages.riders = function (root) {
       if (state.businessDate) NOL3Storage.set("nol3_business_day_date_v1", String(state.businessDate));
       if (state.businessDaySettings) NOL3Storage.set("nol3_business_day_settings_v1", String(state.businessDaySettings));
       if (state.fleetProductivity !== undefined && state.fleetProductivity !== "") {
-        NOL3Storage.set("nol3_fleet_productivity_v1", String(state.fleetProductivity));
+        NOL3Storage.set("nol3_fleet_productivity_v1:" + HUB_NAME, String(state.fleetProductivity));
       }
       if (Array.isArray(state.planningExceptions)) {
         NOL3Storage.set("nol3_planning_exceptions_v1:" + HUB_NAME, JSON.stringify(state.planningExceptions));
       }
       if (state.planningLayout && typeof state.planningLayout === "object") {
         const store = parseObject(NOL3Storage.get("nol3_planning_layout_v1"), {});
-        store[HUB_NAME] = state.planningLayout;
-        NOL3Storage.set("nol3_planning_layout_v1", JSON.stringify(store));
+        const byHub = store?.byHub && typeof store.byHub === "object"
+          ? store.byHub
+          : (Array.isArray(store) ? { __NO_HUB__: store } : store);
+        const normalized = {
+          version: 2,
+          byHub: { ...(byHub || {}) }
+        };
+        normalized.byHub[HUB_NAME] = state.planningLayout;
+        NOL3Storage.set("nol3_planning_layout_v1", JSON.stringify(normalized));
       }
       if (state.zoneOverrides && typeof state.zoneOverrides === "object") {
         const store = parseObject(NOL3Storage.get("nol3_zone_id_overrides_v1"), {});
@@ -8951,24 +10238,90 @@ NOL3.pages.riders = function (root) {
 
   async function restoreIndexedDB(records) {
     if (!Array.isArray(records)) return;
+    const restoredTypes = new Set();
     for (const record of records) {
-      if (record && record.type) await putIndexedDB(record);
+      if (record && record.type) {
+        await putIndexedDB(record);
+        restoredTypes.add(record.type);
+      }
     }
+    if (restoredTypes.has("riders")) {
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", data: NOL3FileStore.get("riders") } }));
+    }
+    if (restoredTypes.has("unifiedInventory")) {
+      const rec = NOL3FileStore.get("unifiedInventory");
+      if (rec?.dataset) {
+        NOL3.lmInventory = {
+          files: rec.files || [],
+          fileName: rec.dataset.fileName || "",
+          headers: rec.dataset.headers || [],
+          rows: rec.dataset.lmRows || [],
+          filteredRows: [],
+          loadedAt: rec.dataset.loadedAt || "",
+          rowCount: Array.isArray(rec.dataset.lmRows) ? rec.dataset.lmRows.length : 0
+        };
+        NOL3.incomingInventory = {
+          files: rec.files || [],
+          fileName: rec.dataset.fileName || "",
+          headers: rec.dataset.headers || [],
+          rows: rec.dataset.incomingRows || [],
+          filteredRows: [],
+          rawText: rec.dataset.rawText || "",
+          loadedAt: rec.dataset.loadedAt || "",
+          rowCount: Array.isArray(rec.dataset.incomingRows) ? rec.dataset.incomingRows.length : 0
+        };
+        try { if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory); } catch (_) {}
+        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "lm", data: NOL3.lmInventory } }));
+        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "incoming", data: NOL3.incomingInventory } }));
+        window.dispatchEvent(new CustomEvent("unifiedinventoryloaded", { detail: { fileName: rec.dataset.fileName || "", rowCount: Array.isArray(rec.dataset.rows) ? rec.dataset.rows.length : 0 } }));
+      }
+    }
+  }
+
+  function snapshotHasData(channel, snapshot) {
+    try {
+      if (!snapshot) return false;
+      if (channel === rosterChannel) {
+        const r = snapshot.riderData;
+        return !!(r && ((Array.isArray(r.rows) && r.rows.length) || r.fileName || r.rawText));
+      }
+      if (channel === filesChannel) {
+        const has = v => !!(v && ((Array.isArray(v.rows) && v.rows.length) || v.fileName || v.rawText));
+        return has(snapshot.lmInventory) || has(snapshot.incomingInventory) || has(snapshot.lineHaulInventory);
+      }
+      return !!snapshot.localState;
+    } catch (_) { return false; }
+  }
+
+  function mergeFilesSnapshotPreservingRemote(local, remote) {
+    if (!local || !remote) return local;
+    const has = v => !!(v && ((Array.isArray(v.rows) && v.rows.length) || v.fileName || v.rawText));
+    const merged = { ...local };
+    for (const key of ["lmInventory", "incomingInventory", "lineHaulInventory"]) {
+      if (!has(local[key]) && has(remote[key])) merged[key] = remote[key];
+    }
+    if ((!Array.isArray(local.arrivedIncomingTasks) || local.arrivedIncomingTasks.length === 0) &&
+        Array.isArray(remote.arrivedIncomingTasks) && remote.arrivedIncomingTasks.length) {
+      merged.arrivedIncomingTasks = remote.arrivedIncomingTasks;
+    }
+    return merged;
   }
 
   async function initialSyncChannel(channel) {
     const remote = await readRemoteFor(channel);
-    const local = await channel.buildSnapshot();
+    let local = await channel.buildSnapshot();
     const savedRemoteTime = Number(localStorage.getItem(channel.metaKey) || 0);
 
+    // NEVER create or overwrite a cloud row with an empty startup snapshot.
+    // A refresh starts with empty in-memory upload objects; those are not a
+    // user action and must wait for the cloud copy to be restored.
     if (!remote || !remote.data) {
-      local.clientUpdatedAt = Date.now();
-      channel.lastLocalMutationAt = local.clientUpdatedAt;
-      await pushSnapshotFor(channel, local);
-      localStorage.setItem(channel.metaKey, String(local.clientUpdatedAt));
-      channel.lastRemoteUpdatedAt = local.clientUpdatedAt;
-      channel.lastHash = stableHash(await channel.buildSnapshot());
+      // Startup is read/restore only. Never auto-save local startup state.
+      // An explicit upload or SAVE DATA action is required to create cloud data.
       channel.initialized = true;
+      channel.lastHash = stableHash(local);
+      channel.lastRemoteUpdatedAt = 0;
+      channel.lastLocalMutationAt = 0;
       return false;
     }
 
@@ -8976,7 +10329,24 @@ NOL3.pages.riders = function (root) {
     const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
     const localTime = Math.max(savedRemoteTime, channel.lastLocalMutationAt || 0);
 
-    if (remoteTime > localTime) {
+    // A deliberate Clear is an authoritative empty snapshot. Never merge old
+    // browser-local uploads back into it.
+    if (channel === filesChannel && remoteSnapshot?.clearedByUser === true) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      try { localStorage.setItem(channel.metaKey, String(remoteTime)); } catch (_) {}
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
+    const localHasData = snapshotHasData(channel, local);
+    const remoteHasData = snapshotHasData(channel, remoteSnapshot);
+
+    // Refresh-safe rule: if the browser has no meaningful data, cloud wins
+    // regardless of remembered timestamps. This is the key protection against
+    // refresh wiping uploaded files or riders.
+    if (remoteHasData && !localHasData) {
       await channel.applyRemote(remoteSnapshot);
       channel.lastRemoteUpdatedAt = remoteTime;
       channel.lastLocalMutationAt = remoteTime;
@@ -8986,18 +10356,31 @@ NOL3.pages.riders = function (root) {
       return true;
     }
 
-    // The browser already has the same cloud version. Keep local data and
-    // push it only when it differs from the cloud snapshot.
+    // If both sides contain data, prefer a newer cloud version.
+    if (remoteHasData && remoteTime > localTime) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      localStorage.setItem(channel.metaKey, String(remoteTime));
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
+
+    // If the local files snapshot is only partially populated (for example
+    // the user uploaded Incoming but not LM after opening a fresh page),
+    // preserve the other cloud datasets instead of replacing them with null.
+    if (channel === filesChannel && remoteHasData) {
+      local = mergeFilesSnapshotPreservingRemote(local, remoteSnapshot);
+    }
+
+    // Local data is authoritative only when it was actually present at
+    // startup or the cloud is empty. Never push a completely empty snapshot.
     channel.lastRemoteUpdatedAt = remoteTime;
     channel.lastLocalMutationAt = localTime;
-    const localNow = await channel.buildSnapshot();
-    if (stableHash(localNow) !== stableHash(remoteSnapshot)) {
-      localNow.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
-      channel.lastLocalMutationAt = localNow.clientUpdatedAt;
-      await pushSnapshotFor(channel, localNow);
-      localStorage.setItem(channel.metaKey, String(localNow.clientUpdatedAt));
-      channel.lastRemoteUpdatedAt = localNow.clientUpdatedAt;
-    }
+    // Do not auto-push a local difference during startup. The user must click
+    // SAVE DATA (or perform an explicit upload) to write local changes to cloud.
+    localStorage.setItem(channel.metaKey, String(remoteTime || localTime || 0));
     channel.lastHash = stableHash(await channel.buildSnapshot());
     channel.initialized = true;
     return false;
@@ -9030,7 +10413,11 @@ NOL3.pages.riders = function (root) {
       const message = String(failures[0].reason?.message || failures[0].reason || "");
       status(/^(400|401|403):/.test(message) ? "KEY REJECTED BY SUPABASE • CHECK KEY" : "ERROR • CHECK SUPABASE", false);
     }
-    if (anyReloaded) setTimeout(() => location.reload(), 250);
+    if (anyReloaded) {
+      try {
+        if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+      } catch (_) {}
+    }
   }
 
   async function ensureChannelInitialized(channel) {
@@ -9042,7 +10429,7 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function syncChannelOnce(channel) {
+  async function syncChannelOnce(channel, allowPush = false) {
     if (channel.syncing || !configured() || applyingRemote) return false;
     if (!channel.initialized) {
       // Self-heal: a channel that failed its first sync attempt (e.g. a
@@ -9055,9 +10442,18 @@ NOL3.pages.riders = function (root) {
     try {
       const local = await channel.buildSnapshot();
       const currentHash = stableHash(local);
-      if (currentHash !== channel.lastHash) {
+      if (
+        currentHash !== channel.lastHash &&
+        allowPush &&
+        (snapshotHasData(channel, local) || channel.allowEmptyPush) &&
+        !(channel === filesChannel && channel.lastRemoteClearedByUser && !snapshotHasData(channel, local))
+      ) {
+        if (channel === filesChannel && snapshotHasData(channel, local)) {
+          channel.lastRemoteClearedByUser = false;
+        }
         channel.lastLocalMutationAt = Date.now();
         local.clientUpdatedAt = channel.lastLocalMutationAt;
+        if (channel === filesChannel) channel.lastRemoteClearedByUser = false;
         await pushSnapshotFor(channel, local);
         channel.lastHash = stableHash(await channel.buildSnapshot());
         channel.lastRemoteUpdatedAt = channel.lastLocalMutationAt;
@@ -9082,22 +10478,30 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function syncSettingsAndRoster() {
+  async function syncSettingsAndRoster(allowPush = false) {
     try {
-      const a = await syncChannelOnce(settingsChannel);
-      const b = await syncChannelOnce(rosterChannel);
+      const a = await syncChannelOnce(settingsChannel, allowPush);
+      const b = await syncChannelOnce(rosterChannel, allowPush);
       status(a || b ? "SYNCED • CLOUD UPDATE" : "CONNECTED • LIVE", true);
-      if (a || b) setTimeout(() => location.reload(), 250);
+      if (a || b) {
+        try {
+          if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        } catch (_) {}
+      }
     } catch (error) {
       console.error("NOL3 cloud sync failed:", error);
       status("OFFLINE • RETRYING", false);
     }
   }
 
-  async function syncFiles() {
+  async function syncFiles(allowPush = false) {
     try {
-      const reload = await syncChannelOnce(filesChannel);
-      if (reload) setTimeout(() => location.reload(), 250);
+      const reload = await syncChannelOnce(filesChannel, allowPush);
+      if (reload) {
+        try {
+          if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        } catch (_) {}
+      }
     } catch (error) {
       console.error("NOL3 cloud file sync failed:", error);
     }
@@ -9105,8 +10509,16 @@ NOL3.pages.riders = function (root) {
 
   // Kept for any code elsewhere that calls window.NOL3CloudSync.syncNow().
   async function syncOnce() {
-    await syncSettingsAndRoster();
-    await syncFiles();
+    try {
+      await syncChannelOnce(settingsChannel, true);
+      await syncChannelOnce(rosterChannel, true);
+      await syncChannelOnce(filesChannel, true);
+      status("SAVED • CLOUD", true);
+    } catch (error) {
+      console.error("NOL3 manual cloud save failed:", error);
+      status("SAVE FAILED", false);
+      throw error;
+    }
   }
 
   function schedulePushCheck(channel, runner) {
@@ -9114,8 +10526,40 @@ NOL3.pages.riders = function (root) {
     channel.pushTimer = setTimeout(() => runner(), channel.debounceMs);
   }
 
+  async function clearUploadedFilesCloud() {
+    const emptySnapshot = {
+      version: 4,
+      hubId: HUB_ID,
+      hubName: HUB_NAME,
+      hubCode: HUB_CODE,
+      clientUpdatedAt: Date.now(),
+      clearedAt: Date.now(),
+      clearedByUser: true,
+      lmInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      incomingInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      lineHaulInventory: {
+        fileName: "", files: [], headers: [], rows: [], filteredRows: [], rawText: "", loadedAt: ""
+      },
+      arrivedIncomingTasks: []
+    };
+
+    await pushSnapshotFor(filesChannel, emptySnapshot);
+    filesChannel.initialized = true;
+    filesChannel.lastHash = stableHash(emptySnapshot);
+    filesChannel.lastRemoteUpdatedAt = emptySnapshot.clientUpdatedAt;
+    filesChannel.lastLocalMutationAt = emptySnapshot.clientUpdatedAt;
+    filesChannel.lastRemoteClearedByUser = true;
+    try { localStorage.setItem(filesChannel.metaKey, String(emptySnapshot.clientUpdatedAt)); } catch (_) {}
+    return emptySnapshot;
+  }
+
   window.NOL3CloudSync = {
     syncNow: syncOnce,
+    clearUploadedFilesCloud,
     hubId: HUB_ID,
     hubName: HUB_NAME,
     hubCode: HUB_CODE
@@ -9141,6 +10585,12 @@ NOL3.pages.riders = function (root) {
         if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state.currentPage || "planning");
       } catch (e) { console.warn("NOL3: Could not lock Dolores-Abra Hub UI", e); }
 
+      // Every fresh page load starts on today's Philippines business date.
+      try {
+        const today = typeof getNOL3TodayDate === "function" ? getNOL3TodayDate() : new Date().toISOString().slice(0,10);
+        NOL3.currentBusinessDate = today;
+        NOL3Storage.set("nol3_business_day_date_v1", today);
+      } catch (_) {}
       initialSync().then(() => {
         setInterval(syncSettingsAndRoster, settingsChannel.pollMs);
         setInterval(syncFiles, filesChannel.pollMs);
@@ -9152,19 +10602,55 @@ NOL3.pages.riders = function (root) {
   // also detected by each channel's own periodic snapshot hash, but scheduling
   // an immediate check here makes edits show up on other devices without
   // waiting for the next poll.
-  window.addEventListener("hubchange", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
-  window.addEventListener("planningchanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
-  window.addEventListener("zonechanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
-  window.addEventListener("inventoryloaded", (event) => {
-    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
-    else schedulePushCheck(filesChannel, syncFiles);
+  window.addEventListener("hubchange", () => {
+    const hub = (NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME;
+    const savedRider = window.NOL3RiderHubStore?.load?.(hub);
+    if (savedRider) {
+      NOL3.riderData = savedRider;
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "hub-local" } }));
+    } else {
+      NOL3.riderData = null;
+    }
   });
+  // Auto-save local changes after the initial cloud restore has completed.
+  // Cloud-originated events are ignored so a remote restore cannot immediately
+  // echo itself back as a new local version.
+  window.addEventListener("planningchanged", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
+  });
+
+  window.addEventListener("zonesettingschanged", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
+  });
+
+  window.addEventListener("businessdatechange", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(settingsChannel, () => syncSettingsAndRoster(true));
+  });
+
+  window.addEventListener("inventoryloaded", (event) => {
+    if (applyingRemote || event?.detail?.source === "cloud" || event?.detail?.source === "hub-local") return;
+    const type = event?.detail?.type;
+    if (type === "riders") {
+      schedulePushCheck(rosterChannel, () => syncSettingsAndRoster(true));
+    } else if (type === "lm" || type === "incoming" || type === "linehaul") {
+      // Historical/date-switch restores are LOCAL views of a saved snapshot.
+      // They must NEVER overwrite the shared current operational dataset in
+      // Supabase. Only a real upload (or an explicit clear) may push files.
+      if (event?.detail?.historical === true || event?.detail?.source === "historical") return;
+      // A real upload intentionally supersedes the previous Clear tombstone.
+      filesChannel.lastRemoteClearedByUser = false;
+      schedulePushCheck(filesChannel, () => syncFiles(true));
+    }
+  });
+
   window.addEventListener("inventorycleared", (event) => {
-    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
-    else schedulePushCheck(filesChannel, syncFiles);
+    if (applyingRemote || event?.detail?.source === "cloud") return;
+    schedulePushCheck(filesChannel, () => syncFiles(true));
   });
 })();
 </script>
-
 </body>
 </html>

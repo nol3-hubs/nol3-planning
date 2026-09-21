@@ -2381,20 +2381,26 @@ window.NOL3.escapeHTML = function(value) {
 };
 
 
+// This copy of the dashboard is permanently locked to one hub. Seeding
+// selectedHub/hubs from this hardcoded constant — instead of from
+// localStorage — closes a real cross-hub data leak: all 26 hub files are
+// hosted on the same origin and therefore share the same localStorage, so
+// reading "last selected hub" from storage here could return whichever hub
+// was last opened in ANY of the 26 files on this browser, not necessarily
+// this one. Every hub-scoped read (Planning layout, zone settings, business
+// day settings, etc.) depends on this value being correct from the very
+// first line of script execution, not after some later async correction.
+const NOL3_FIXED_HUB_NAME = "Badoc Hub";
+
 (function () {
   const HUBS_KEY = "nol3_hubs";
   const SELECTED_HUB_KEY = "nol3_selected_hub";
 
-  let hubs = JSON.parse(NOL3Storage.get(HUBS_KEY) || "[]")
-    .filter(hub => hub !== "Main Hub");
-
+  let hubs = [NOL3_FIXED_HUB_NAME];
   NOL3Storage.set(HUBS_KEY, JSON.stringify(hubs));
 
-  let selectedHub = NOL3Storage.get(SELECTED_HUB_KEY) || "";
-  if (selectedHub === "Main Hub") {
-    selectedHub = "";
-    NOL3Storage.remove(SELECTED_HUB_KEY);
-  }
+  let selectedHub = NOL3_FIXED_HUB_NAME;
+  NOL3Storage.set(SELECTED_HUB_KEY, selectedHub);
 
   NOL3.state = {
     hubs,
