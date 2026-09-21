@@ -9693,6 +9693,7 @@ NOL3.pages.riders = function (root) {
     async buildSnapshot() {
       const lm = window.NOL3?.lmInventory || null;
       const incoming = window.NOL3?.incomingInventory || null;
+      const linehaul = window.NOL3?.lineHaulInventory || null;
       return {
         version: 3,
         hubId: HUB_ID,
@@ -9715,6 +9716,18 @@ NOL3.pages.riders = function (root) {
           rows: Array.isArray(incoming.rows) ? incoming.rows : [],
           rawText: typeof incoming.rawText === "string" ? incoming.rawText : "",
           loadedAt: incoming.loadedAt || ""
+        } : null,
+        // Incoming Orders are matched by SPX tracking number against the
+        // Incoming From-To / Linehaul export. Sync that second dataset too;
+        // without it another device has Incoming Inventory but cannot build
+        // the Incoming Orders list.
+        lineHaulInventory: linehaul ? {
+          fileName: linehaul.fileName || "",
+          files: Array.isArray(linehaul.files) ? linehaul.files : [],
+          headers: Array.isArray(linehaul.headers) ? linehaul.headers : [],
+          rows: Array.isArray(linehaul.rows) ? linehaul.rows : [],
+          rawText: typeof linehaul.rawText === "string" ? linehaul.rawText : "",
+          loadedAt: linehaul.loadedAt || ""
         } : null,
         arrivedIncomingTasks: (() => {
           try {
@@ -9760,6 +9773,19 @@ NOL3.pages.riders = function (root) {
           loadedAt: incoming.loadedAt || new Date().toISOString(),
           rowCount: Array.isArray(incoming.rows) ? incoming.rows.length : 0,
           rawText: typeof incoming.rawText === "string" ? incoming.rawText : ""
+        };
+      }
+
+      if (data.lineHaulInventory) {
+        const linehaul = data.lineHaulInventory;
+        NOL3.lineHaulInventory = {
+          fileName: linehaul.fileName || "",
+          files: Array.isArray(linehaul.files) ? linehaul.files : [],
+          headers: Array.isArray(linehaul.headers) ? linehaul.headers : [],
+          rows: Array.isArray(linehaul.rows) ? linehaul.rows : [],
+          loadedAt: linehaul.loadedAt || new Date().toISOString(),
+          rowCount: Array.isArray(linehaul.rows) ? linehaul.rows.length : 0,
+          rawText: typeof linehaul.rawText === "string" ? linehaul.rawText : ""
         };
       }
 
