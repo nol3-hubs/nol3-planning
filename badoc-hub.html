@@ -8150,9 +8150,11 @@ NOL3.pages.riders = function (root) {
         </label>
         <label class="topbar-business-field">
           <span class="topbar-business-label">LH COT HOUR</span>
-          <input class="topbar-business-hour" id="businessDayCotHour" type="number" min="0" max="23" step="1" inputmode="numeric" aria-label="Line Haul COT hour" value="14">
+          <input class="topbar-business-hour" id="businessDayCotHour" type="number" min="0" max="23" step="1" inputmode="numeric" aria-label="Line Haul COT hour" value="15">
         </label>
-        <button class="topbar-save-data" id="saveDataBtn" type="button" title="Save the current hub weekly summary as CSV">SAVE DATA</button>
+        <button class="topbar-save-data" id="saveDataBtn" type="button" title="Save current changes and export the weekly summary">SAVE DATA</button>
+        <button class="topbar-save-data" id="clearDataBtn" type="button" title="Clear uploaded files only" style="margin-left:6px;background:#fff;color:#b42318;border:1px solid #f0b7b2;">CLEAR</button>
+        <button class="topbar-save-data" id="refreshAppBtn" type="button" title="Refresh the app" style="margin-left:6px;">REFRESH</button>
         <div class="topbar-business-status" id="businessDayStatus"></div>
       </div>
       <div class="header-badge">NOL3</div>
@@ -8551,6 +8553,10 @@ NOL3.pages.riders = function (root) {
 
       if (!hub) throw new Error("Select a hub before saving the daily summary.");
 
+      // SAVE DATA is now the explicit cloud-save action. Nothing else writes
+      // local edits to Supabase automatically.
+      if (window.NOL3CloudSync?.syncNow) await window.NOL3CloudSync.syncNow();
+
       const date = new Date(`${businessDate}T00:00:00`);
       const day = date.getDay();
       const mondayOffset = day === 0 ? -6 : 1 - day;
@@ -8667,6 +8673,60 @@ NOL3.pages.riders = function (root) {
     event.preventDefault();
     event.stopPropagation();
     if (!button.disabled && typeof NOL3.saveDataBackup === "function") NOL3.saveDataBackup();
+  }, true);
+
+  // Manual Clear: remove uploaded operational files only.
+  // Rider roster, town arrangements, zone settings, planning exceptions, and other hub settings are preserved.
+  const clearAllUploadedFiles = async () => {
+    const clearBtn = document.getElementById("clearDataBtn");
+    if (clearBtn) { clearBtn.disabled = true; clearBtn.textContent = "CLEARING..."; }
+    try {
+      const clearTypes = ["lm", "incoming", "linehaul"];
+      for (const type of clearTypes) {
+        try { await NOL3.clearUploadedData(type); } catch (_) {}
+      }
+      NOL3.lmInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+      NOL3.incomingInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+      NOL3.lineHaulInventory = { files: [], rows: [], filteredRows: [], fileName: "", headers: [], loadedAt: "", rowCount: 0 };
+      try { window.dispatchEvent(new CustomEvent("inventorycleared", { detail: { type: "all", source: "manual" } })); } catch (_) {}
+      try { if (typeof renderBusinessDayMetrics === "function") renderBusinessDayMetrics(); } catch (_) {}
+      try { if (typeof renderDeliveryAreas === "function") renderDeliveryAreas(); } catch (_) {}
+      try { if (typeof renderIncomingOrders === "function") renderIncomingOrders(); } catch (_) {}
+      try { if (typeof renderUnassignedOrders === "function") renderUnassignedOrders(); } catch (_) {}
+      try { if (typeof renderPlanning === "function") renderPlanning(); } catch (_) {}
+
+      // Explicitly allow the cloud files channel to write the intentional empty state.
+      const filesChannel = window.NOL3CloudSync?.channels?.files;
+      if (filesChannel) filesChannel.allowEmptyPush = true;
+      try { if (window.NOL3CloudSync?.syncNow) await window.NOL3CloudSync.syncNow(); }
+      finally { if (filesChannel) filesChannel.allowEmptyPush = false; }
+      alert("Uploaded files were cleared. Rider data, town arrangements, zone settings, and planning exceptions were kept.");
+    } finally {
+      if (clearBtn) { clearBtn.disabled = false; clearBtn.textContent = "CLEAR"; }
+    }
+  };
+
+  document.addEventListener("click", function (event) {
+    const button = event.target?.closest?.("#clearDataBtn");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    const confirmed = window.confirm("Clear all uploaded files?\n\nThis will clear LM Inventory, Incoming Inventory, and the Incoming From-To List. Rider data, town arrangements, zone settings, and planning exceptions will NOT be cleared.\n\nContinue?");
+    if (confirmed) clearAllUploadedFiles().catch(error => {
+      console.error("NOL3: Could not clear uploaded files.", error);
+      alert(`Could not complete Clear: ${error?.message || "unknown error"}`);
+    });
+  }, true);
+
+  // Refresh the app without clearing or changing any saved data.
+  document.addEventListener("click", function (event) {
+    const button = event.target?.closest?.("#refreshAppBtn");
+    if (!button) return;
+    event.preventDefault();
+    event.stopPropagation();
+    if (button.disabled) return;
+    window.location.reload();
   }, true);
 
   // Automatic weekly export: on Monday, export the PREVIOUS week's captured
@@ -10102,20 +10162,12 @@ NOL3.pages.riders = function (root) {
     // A refresh starts with empty in-memory upload objects; those are not a
     // user action and must wait for the cloud copy to be restored.
     if (!remote || !remote.data) {
-      if (!snapshotHasData(channel, local)) {
-        channel.initialized = true;
-        channel.lastHash = stableHash(local);
-        channel.lastRemoteUpdatedAt = 0;
-        channel.lastLocalMutationAt = 0;
-        return false;
-      }
-      local.clientUpdatedAt = Date.now();
-      channel.lastLocalMutationAt = local.clientUpdatedAt;
-      await pushSnapshotFor(channel, local);
-      localStorage.setItem(channel.metaKey, String(local.clientUpdatedAt));
-      channel.lastRemoteUpdatedAt = local.clientUpdatedAt;
-      channel.lastHash = stableHash(await channel.buildSnapshot());
+      // Startup is read/restore only. Never auto-save local startup state.
+      // An explicit upload or SAVE DATA action is required to create cloud data.
       channel.initialized = true;
+      channel.lastHash = stableHash(local);
+      channel.lastRemoteUpdatedAt = 0;
+      channel.lastLocalMutationAt = 0;
       return false;
     }
 
@@ -10160,15 +10212,9 @@ NOL3.pages.riders = function (root) {
     // startup or the cloud is empty. Never push a completely empty snapshot.
     channel.lastRemoteUpdatedAt = remoteTime;
     channel.lastLocalMutationAt = localTime;
-    if (snapshotHasData(channel, local) && stableHash(local) !== stableHash(remoteSnapshot)) {
-      local.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
-      channel.lastLocalMutationAt = local.clientUpdatedAt;
-      await pushSnapshotFor(channel, local);
-      localStorage.setItem(channel.metaKey, String(local.clientUpdatedAt));
-      channel.lastRemoteUpdatedAt = local.clientUpdatedAt;
-    } else {
-      localStorage.setItem(channel.metaKey, String(remoteTime || localTime || 0));
-    }
+    // Do not auto-push a local difference during startup. The user must click
+    // SAVE DATA (or perform an explicit upload) to write local changes to cloud.
+    localStorage.setItem(channel.metaKey, String(remoteTime || localTime || 0));
     channel.lastHash = stableHash(await channel.buildSnapshot());
     channel.initialized = true;
     return false;
@@ -10217,7 +10263,7 @@ NOL3.pages.riders = function (root) {
     }
   }
 
-  async function syncChannelOnce(channel) {
+  async function syncChannelOnce(channel, allowPush = false) {
     if (channel.syncing || !configured() || applyingRemote) return false;
     if (!channel.initialized) {
       // Self-heal: a channel that failed its first sync attempt (e.g. a
@@ -10230,7 +10276,7 @@ NOL3.pages.riders = function (root) {
     try {
       const local = await channel.buildSnapshot();
       const currentHash = stableHash(local);
-      if (currentHash !== channel.lastHash) {
+      if (currentHash !== channel.lastHash && allowPush && (snapshotHasData(channel, local) || channel.allowEmptyPush)) {
         channel.lastLocalMutationAt = Date.now();
         local.clientUpdatedAt = channel.lastLocalMutationAt;
         await pushSnapshotFor(channel, local);
@@ -10288,8 +10334,16 @@ NOL3.pages.riders = function (root) {
 
   // Kept for any code elsewhere that calls window.NOL3CloudSync.syncNow().
   async function syncOnce() {
-    await syncSettingsAndRoster();
-    await syncFiles();
+    try {
+      await syncChannelOnce(settingsChannel, true);
+      await syncChannelOnce(rosterChannel, true);
+      await syncChannelOnce(filesChannel, true);
+      status("SAVED • CLOUD", true);
+    } catch (error) {
+      console.error("NOL3 manual cloud save failed:", error);
+      status("SAVE FAILED", false);
+      throw error;
+    }
   }
 
   function schedulePushCheck(channel, runner) {
@@ -10350,21 +10404,12 @@ NOL3.pages.riders = function (root) {
     } else {
       NOL3.riderData = null;
     }
-    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
-    schedulePushCheck(rosterChannel, syncSettingsAndRoster);
   });
-  window.addEventListener("planningchanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
-  window.addEventListener("zonechanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
-  window.addEventListener("inventoryloaded", (event) => {
-    if (event.detail?.source === "cloud") return;
-    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
-    else schedulePushCheck(filesChannel, syncFiles);
-  });
-  window.addEventListener("inventorycleared", (event) => {
-    if (event.detail?.source === "cloud") return;
-    if (event.detail?.type === "riders") schedulePushCheck(rosterChannel, syncSettingsAndRoster);
-    else schedulePushCheck(filesChannel, syncFiles);
-  });
+  // Cloud writes are manual only. Local edits/uploads are no longer auto-saved.
+  window.addEventListener("planningchanged", () => {});
+  window.addEventListener("zonechanged", () => {});
+  window.addEventListener("inventoryloaded", () => {});
+  window.addEventListener("inventorycleared", () => {});
 })();
 </script>
 </body>
