@@ -4602,13 +4602,36 @@ NOL3.pages.planning = function (root) {
         console.warn("NOL3: Could not restore today's LM snapshot from NOW.", error);
       }
 
-      renderBusinessDayMetrics();
+      // The date-change event is asynchronous and is not awaited by dispatchEvent().
+      // Therefore NOW must also rebuild the currently visible page itself after
+      // the dated snapshot has finished loading. Otherwise the old DOM can stay
+      // visible until a full browser Refresh rebuilds it.
+      try {
+        if (typeof NOL3.renderPage === "function") {
+          NOL3.renderPage(NOL3.state?.currentPage || "planning");
+        }
+      } catch (_) {}
+
+      const refreshNowViews = () => {
+        try {
+          if (typeof NOL3.refreshPlanningViews === "function") {
+            NOL3.refreshPlanningViews();
+          } else {
+            renderBusinessDayMetrics();
+          }
+        } catch (_) {}
+      };
+      refreshNowViews();
+      requestAnimationFrame(() => {
+        refreshNowViews();
+        requestAnimationFrame(refreshNowViews);
+        setTimeout(refreshNowViews, 100);
+        setTimeout(refreshNowViews, 500);
+      });
+
       window.dispatchEvent(new CustomEvent("businessdatechange", {
         detail: { businessDate: today, source: "now", lmAlreadyLoaded: true }
       }));
-
-      // Do not rebuild the page here. The active LM snapshot is already loaded
-      // and the normal inventory/date listeners will refresh the visible views.
     };
 
     const INCOMING_ARRIVED_STORAGE_KEY = "nol3_incoming_arrived_tasks_v1";
@@ -7807,6 +7830,22 @@ NOL3.pages.planning = function (root) {
       saveZoneSettingAssignment(town, select.dataset.zoneId || '', select.value || '');
       renderZoneSettings();
     });
+    // Expose the Planning page's closure-scoped renderers so external
+    // Business Date / cloud-restore handlers can refresh the CURRENT DOM.
+    // These functions are intentionally inside the Planning page scope;
+    // calling renderDeliveryAreas() from outside this scope does nothing.
+    NOL3.refreshPlanningViews = function () {
+      try { renderOnFloorTowns(); } catch (_) {}
+      try { renderDeliveryAreas(); } catch (_) {}
+      try { renderIncomingOrders(); } catch (_) {}
+      try { updateIncomingOrdersNotification(); } catch (_) {}
+      try { renderPlanningExceptions(); } catch (_) {}
+      try { renderUnassignedOrders(); } catch (_) {}
+      try { renderParcelRecords(); } catch (_) {}
+      try { renderZoneSettings(); } catch (_) {}
+      try { renderBusinessDayMetrics(); } catch (_) {}
+    };
+
     window.addEventListener('inventoryloaded', event => { if (event.detail?.type === 'lm') { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); } });
     window.addEventListener('inventorycleared', event => { if (event.detail?.type === 'lm') { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); } });
     window.addEventListener('hubchange', () => { renderZoneSettings(); renderOnFloorTowns(); renderDeliveryAreas(); });
@@ -9540,10 +9579,25 @@ NOL3.pages.riders = function (root) {
         if (typeof NOL3.renderPage === "function") NOL3.renderPage(currentPage);
       } catch (_) {}
 
-      renderAfterDateRestore();
-      requestAnimationFrame(() => {
+      // renderPage() recreates the Planning DOM, so the closure-scoped
+      // Planning renderers must run AFTER that rebuild. Use the exported
+      // refresh hook rather than trying to call those local functions from
+      // this outer scope.
+      const refreshCurrentPlanningDOM = () => {
+        try {
+          if (typeof NOL3.refreshPlanningViews === "function") {
+            NOL3.refreshPlanningViews();
+            return;
+          }
+        } catch (_) {}
         renderAfterDateRestore();
-        setTimeout(renderAfterDateRestore, 50);
+      };
+      refreshCurrentPlanningDOM();
+      requestAnimationFrame(() => {
+        refreshCurrentPlanningDOM();
+        requestAnimationFrame(refreshCurrentPlanningDOM);
+        setTimeout(refreshCurrentPlanningDOM, 100);
+        setTimeout(refreshCurrentPlanningDOM, 500);
       });
     } catch (error) {
       console.warn("NOL3: Could not switch LM snapshot for Business Date.", error);
