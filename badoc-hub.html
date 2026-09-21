@@ -4229,7 +4229,7 @@ NOL3.pages.planning = function (root) {
     const BUSINESS_DAY_SETTINGS_KEY = "nol3_business_day_settings_v1";
     const BUSINESS_DAY_DATE_KEY = "nol3_business_day_date_v1";
     const BUSINESS_DAY_DEFAULT_START = 3;
-    const BUSINESS_DAY_DEFAULT_COT = 14;
+    const BUSINESS_DAY_DEFAULT_COT = 15;
 
     const formatBusinessDateInput = (date = new Date()) => {
       const y = date.getFullYear();
@@ -4267,19 +4267,13 @@ NOL3.pages.planning = function (root) {
     };
 
     const getBusinessDateValue = () => {
-      // Business Date is session state. Once established, NEVER replace it
-      // with today's date merely because a menu/topbar is being rendered.
+      // Planning always opens on the current Philippines calendar date.
+      // A previously selected date is still usable during the current session,
+      // but a page refresh/new session starts on today rather than yesterday's
+      // saved business date.
       if (/^\d{4}-\d{2}-\d{2}$/.test(String(NOL3.currentBusinessDate || ""))) {
         return NOL3.currentBusinessDate;
       }
-      try {
-        const saved = String(NOL3Storage.get(BUSINESS_DAY_DATE_KEY) || "").trim();
-        if (/^\d{4}-\d{2}-\d{2}$/.test(saved)) {
-          NOL3.currentBusinessDate = saved;
-          return saved;
-        }
-      } catch (_) {}
-      // Only use today when there is genuinely no existing Business Date.
       const today = (typeof getNOL3TodayDate === "function")
         ? getNOL3TodayDate()
         : formatBusinessDateInput(new Date());
@@ -4341,7 +4335,7 @@ NOL3.pages.planning = function (root) {
       Object.keys(stored).forEach(key => {
         const value = stored[key];
         if (value && Number(value.businessDayStartHour) === 0 && Number(value.cotHour) === 12) {
-          stored[key] = { businessDayStartHour: 3, cotHour: 14 };
+          stored[key] = { businessDayStartHour: 3, cotHour: 15 };
           changed = true;
         }
       });
@@ -7945,6 +7939,7 @@ NOL3.pages.riders = function (root) {
         NOL3.readCSVFile(file, (result) => {
           NOL3.riderData = result;
           loadedRiderResult = result;
+          if (window.NOL3RiderHubStore?.save) window.NOL3RiderHubStore.save(result);
           renderRiderData(result);
           if (typeof NOL3.saveUploadedData === "function") {
             NOL3.saveUploadedData("riders", [file]);
@@ -8951,6 +8946,36 @@ NOL3.pages.riders = function (root) {
     }
   };
 
+  // Rider roster is hub-specific. Keep a local copy keyed by hub so changing
+  // hubs or refreshing the page never forces the user to upload the same rider
+  // file again. The Supabase roster channel is also hub-specific because each
+  // hub writes to its own hub_data row.
+  const RIDER_HUB_STORE_KEY = "nol3_rider_data_by_hub_v1";
+  const getRiderHubStore = () => parseObject(NOL3Storage.get(RIDER_HUB_STORE_KEY), {});
+  const getCurrentHubName = () => String((NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME || "").trim();
+  const saveRiderDataForHub = (result, hub = getCurrentHubName()) => {
+    if (!result || !hub) return;
+    try {
+      const store = getRiderHubStore();
+      store[hub] = {
+        fileName: result.fileName || "",
+        headers: Array.isArray(result.headers) ? result.headers : [],
+        rows: Array.isArray(result.rows) ? result.rows : [],
+        rawText: typeof result.rawText === "string" ? result.rawText : "",
+        loadedAt: result.loadedAt || new Date().toISOString(),
+        rowCount: Array.isArray(result.rows) ? result.rows.length : Number(result.rowCount || 0)
+      };
+      NOL3Storage.set(RIDER_HUB_STORE_KEY, JSON.stringify(store));
+    } catch (_) {}
+  };
+  const loadRiderDataForHub = (hub = getCurrentHubName()) => {
+    if (!hub) return null;
+    const store = getRiderHubStore();
+    const value = store[hub];
+    return value && typeof value === "object" ? value : null;
+  };
+  window.NOL3RiderHubStore = { save: saveRiderDataForHub, load: loadRiderDataForHub };
+
   NOL3.saveUploadedData = async function (type, files, dataset = null) {
     try {
       const list = Array.isArray(files) ? files : [files];
@@ -9089,17 +9114,25 @@ NOL3.pages.riders = function (root) {
         }));
       }
 
-      const savedRiders = await get("riders");
-      if (savedRiders && Array.isArray(savedRiders.files) && savedRiders.files[0]) {
-        const item = savedRiders.files[0];
-        const text = item.text || "";
-        const rows = text.split(/\r?\n/).filter(row => row.trim() !== "");
-        NOL3.riderData = {
-          fileName: item.name,
-          rowCount: Math.max(0, rows.length - 1),
-          rawText: text,
-          rows
-        };
+      // Restore riders for the selected hub first. Fall back to the legacy
+      // single-roster store once, then migrate it into the hub-specific store.
+      const riderHubData = window.NOL3RiderHubStore?.load?.((NOL3.getState && NOL3.getState().selectedHub) || "");
+      if (riderHubData && (Array.isArray(riderHubData.rows) || riderHubData.rawText)) {
+        NOL3.riderData = riderHubData;
+      } else {
+        const savedRiders = await get("riders");
+        if (savedRiders && Array.isArray(savedRiders.files) && savedRiders.files[0]) {
+          const item = savedRiders.files[0];
+          const text = item.text || "";
+          const rows = text.split(/\r?\n/).filter(row => row.trim() !== "");
+          NOL3.riderData = {
+            fileName: item.name,
+            rowCount: Math.max(0, rows.length - 1),
+            rawText: text,
+            rows
+          };
+          window.NOL3RiderHubStore?.save?.(NOL3.riderData);
+        }
       }
 
       const savedUnified = await get("unifiedInventory");
@@ -9699,6 +9732,7 @@ NOL3.pages.riders = function (root) {
     async applyRemote(data) {
       if (!data || !data.riderData) return;
       NOL3.riderData = data.riderData;
+      window.NOL3RiderHubStore?.save?.(data.riderData, (NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME);
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "cloud" } }));
       if (NOL3.state?.currentPage === "riders" && typeof NOL3.renderPage === "function") {
         NOL3.renderPage("riders");
@@ -10049,8 +10083,30 @@ NOL3.pages.riders = function (root) {
     const remoteSnapshot = remote.data;
     const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
     const localTime = Math.max(savedRemoteTime, channel.lastLocalMutationAt || 0);
+    const localHasData = (() => {
+      try {
+        if (channel === rosterChannel) {
+          const r = window.NOL3?.riderData;
+          return !!(r && (Array.isArray(r.rows) && r.rows.length || r.fileName || r.rawText));
+        }
+        if (channel === filesChannel) {
+          const n = window.NOL3 || {};
+          const lm = n.lmInventory, inc = n.incomingInventory, lh = n.lineHaulInventory;
+          return !!((lm && ((Array.isArray(lm.rows) && lm.rows.length) || lm.fileName || lm.rawText)) ||
+                    (inc && ((Array.isArray(inc.rows) && inc.rows.length) || inc.fileName || inc.rawText)) ||
+                    (lh && ((Array.isArray(lh.rows) && lh.rows.length) || lh.fileName || lh.rawText)));
+        }
+        return true;
+      } catch (_) { return false; }
+    })();
 
-    if (remoteTime > localTime) {
+    // IMPORTANT: a page refresh clears the in-memory uploaded-file objects,
+    // while the last-applied timestamp remains in localStorage. In that
+    // situation localTime can equal the cloud timestamp even though the
+    // browser has NO uploaded data. Never push an empty snapshot over a real
+    // cloud snapshot just because the remembered timestamp matches. Restore
+    // the cloud copy first.
+    if (remoteTime > localTime || (!localHasData && remoteSnapshot)) {
       await channel.applyRemote(remoteSnapshot);
       channel.lastRemoteUpdatedAt = remoteTime;
       channel.lastLocalMutationAt = remoteTime;
@@ -10060,8 +10116,8 @@ NOL3.pages.riders = function (root) {
       return true;
     }
 
-    // The browser already has the same cloud version. Keep local data and
-    // push it only when it differs from the cloud snapshot.
+    // The browser already has the same cloud version and has real local data.
+    // Keep local data and push it only when it differs from the cloud snapshot.
     channel.lastRemoteUpdatedAt = remoteTime;
     channel.lastLocalMutationAt = localTime;
     const localNow = await channel.buildSnapshot();
@@ -10227,6 +10283,12 @@ NOL3.pages.riders = function (root) {
         if (typeof NOL3.renderPage === "function") NOL3.renderPage(NOL3.state.currentPage || "planning");
       } catch (e) { console.warn("NOL3: Could not lock Badoc Hub UI", e); }
 
+      // Every fresh page load starts on today's Philippines business date.
+      try {
+        const today = typeof getNOL3TodayDate === "function" ? getNOL3TodayDate() : new Date().toISOString().slice(0,10);
+        NOL3.currentBusinessDate = today;
+        NOL3Storage.set("nol3_business_day_date_v1", today);
+      } catch (_) {}
       initialSync().then(() => {
         setInterval(syncSettingsAndRoster, settingsChannel.pollMs);
         setInterval(syncFiles, filesChannel.pollMs);
@@ -10238,7 +10300,18 @@ NOL3.pages.riders = function (root) {
   // also detected by each channel's own periodic snapshot hash, but scheduling
   // an immediate check here makes edits show up on other devices without
   // waiting for the next poll.
-  window.addEventListener("hubchange", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
+  window.addEventListener("hubchange", () => {
+    const hub = (NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME;
+    const savedRider = window.NOL3RiderHubStore?.load?.(hub);
+    if (savedRider) {
+      NOL3.riderData = savedRider;
+      window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "hub-local" } }));
+    } else {
+      NOL3.riderData = null;
+    }
+    schedulePushCheck(settingsChannel, syncSettingsAndRoster);
+    schedulePushCheck(rosterChannel, syncSettingsAndRoster);
+  });
   window.addEventListener("planningchanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
   window.addEventListener("zonechanged", () => schedulePushCheck(settingsChannel, syncSettingsAndRoster));
   window.addEventListener("inventoryloaded", (event) => {
