@@ -10064,12 +10064,51 @@ NOL3.pages.riders = function (root) {
     }
   }
 
+  function snapshotHasData(channel, snapshot) {
+    try {
+      if (!snapshot) return false;
+      if (channel === rosterChannel) {
+        const r = snapshot.riderData;
+        return !!(r && ((Array.isArray(r.rows) && r.rows.length) || r.fileName || r.rawText));
+      }
+      if (channel === filesChannel) {
+        const has = v => !!(v && ((Array.isArray(v.rows) && v.rows.length) || v.fileName || v.rawText));
+        return has(snapshot.lmInventory) || has(snapshot.incomingInventory) || has(snapshot.lineHaulInventory);
+      }
+      return !!snapshot.localState;
+    } catch (_) { return false; }
+  }
+
+  function mergeFilesSnapshotPreservingRemote(local, remote) {
+    if (!local || !remote) return local;
+    const has = v => !!(v && ((Array.isArray(v.rows) && v.rows.length) || v.fileName || v.rawText));
+    const merged = { ...local };
+    for (const key of ["lmInventory", "incomingInventory", "lineHaulInventory"]) {
+      if (!has(local[key]) && has(remote[key])) merged[key] = remote[key];
+    }
+    if ((!Array.isArray(local.arrivedIncomingTasks) || local.arrivedIncomingTasks.length === 0) &&
+        Array.isArray(remote.arrivedIncomingTasks) && remote.arrivedIncomingTasks.length) {
+      merged.arrivedIncomingTasks = remote.arrivedIncomingTasks;
+    }
+    return merged;
+  }
+
   async function initialSyncChannel(channel) {
     const remote = await readRemoteFor(channel);
-    const local = await channel.buildSnapshot();
+    let local = await channel.buildSnapshot();
     const savedRemoteTime = Number(localStorage.getItem(channel.metaKey) || 0);
 
+    // NEVER create or overwrite a cloud row with an empty startup snapshot.
+    // A refresh starts with empty in-memory upload objects; those are not a
+    // user action and must wait for the cloud copy to be restored.
     if (!remote || !remote.data) {
+      if (!snapshotHasData(channel, local)) {
+        channel.initialized = true;
+        channel.lastHash = stableHash(local);
+        channel.lastRemoteUpdatedAt = 0;
+        channel.lastLocalMutationAt = 0;
+        return false;
+      }
       local.clientUpdatedAt = Date.now();
       channel.lastLocalMutationAt = local.clientUpdatedAt;
       await pushSnapshotFor(channel, local);
@@ -10083,30 +10122,13 @@ NOL3.pages.riders = function (root) {
     const remoteSnapshot = remote.data;
     const remoteTime = Number(remoteSnapshot?.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
     const localTime = Math.max(savedRemoteTime, channel.lastLocalMutationAt || 0);
-    const localHasData = (() => {
-      try {
-        if (channel === rosterChannel) {
-          const r = window.NOL3?.riderData;
-          return !!(r && (Array.isArray(r.rows) && r.rows.length || r.fileName || r.rawText));
-        }
-        if (channel === filesChannel) {
-          const n = window.NOL3 || {};
-          const lm = n.lmInventory, inc = n.incomingInventory, lh = n.lineHaulInventory;
-          return !!((lm && ((Array.isArray(lm.rows) && lm.rows.length) || lm.fileName || lm.rawText)) ||
-                    (inc && ((Array.isArray(inc.rows) && inc.rows.length) || inc.fileName || inc.rawText)) ||
-                    (lh && ((Array.isArray(lh.rows) && lh.rows.length) || lh.fileName || lh.rawText)));
-        }
-        return true;
-      } catch (_) { return false; }
-    })();
+    const localHasData = snapshotHasData(channel, local);
+    const remoteHasData = snapshotHasData(channel, remoteSnapshot);
 
-    // IMPORTANT: a page refresh clears the in-memory uploaded-file objects,
-    // while the last-applied timestamp remains in localStorage. In that
-    // situation localTime can equal the cloud timestamp even though the
-    // browser has NO uploaded data. Never push an empty snapshot over a real
-    // cloud snapshot just because the remembered timestamp matches. Restore
-    // the cloud copy first.
-    if (remoteTime > localTime || (!localHasData && remoteSnapshot)) {
+    // Refresh-safe rule: if the browser has no meaningful data, cloud wins
+    // regardless of remembered timestamps. This is the key protection against
+    // refresh wiping uploaded files or riders.
+    if (remoteHasData && !localHasData) {
       await channel.applyRemote(remoteSnapshot);
       channel.lastRemoteUpdatedAt = remoteTime;
       channel.lastLocalMutationAt = remoteTime;
@@ -10116,17 +10138,36 @@ NOL3.pages.riders = function (root) {
       return true;
     }
 
-    // The browser already has the same cloud version and has real local data.
-    // Keep local data and push it only when it differs from the cloud snapshot.
+    // If both sides contain data, prefer a newer cloud version.
+    if (remoteHasData && remoteTime > localTime) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      localStorage.setItem(channel.metaKey, String(remoteTime));
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
+
+    // If the local files snapshot is only partially populated (for example
+    // the user uploaded Incoming but not LM after opening a fresh page),
+    // preserve the other cloud datasets instead of replacing them with null.
+    if (channel === filesChannel && remoteHasData) {
+      local = mergeFilesSnapshotPreservingRemote(local, remoteSnapshot);
+    }
+
+    // Local data is authoritative only when it was actually present at
+    // startup or the cloud is empty. Never push a completely empty snapshot.
     channel.lastRemoteUpdatedAt = remoteTime;
     channel.lastLocalMutationAt = localTime;
-    const localNow = await channel.buildSnapshot();
-    if (stableHash(localNow) !== stableHash(remoteSnapshot)) {
-      localNow.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
-      channel.lastLocalMutationAt = localNow.clientUpdatedAt;
-      await pushSnapshotFor(channel, localNow);
-      localStorage.setItem(channel.metaKey, String(localNow.clientUpdatedAt));
-      channel.lastRemoteUpdatedAt = localNow.clientUpdatedAt;
+    if (snapshotHasData(channel, local) && stableHash(local) !== stableHash(remoteSnapshot)) {
+      local.clientUpdatedAt = Math.max(localTime, remoteTime, Date.now());
+      channel.lastLocalMutationAt = local.clientUpdatedAt;
+      await pushSnapshotFor(channel, local);
+      localStorage.setItem(channel.metaKey, String(local.clientUpdatedAt));
+      channel.lastRemoteUpdatedAt = local.clientUpdatedAt;
+    } else {
+      localStorage.setItem(channel.metaKey, String(remoteTime || localTime || 0));
     }
     channel.lastHash = stableHash(await channel.buildSnapshot());
     channel.initialized = true;
