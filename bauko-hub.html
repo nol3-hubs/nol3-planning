@@ -2887,6 +2887,30 @@ const NOL3_FIXED_HUB_NAME = "Bauko Hub";
         loadedAt: new Date().toISOString()
       };
 
+      // IMPORTANT: this main LM upload path must also write to the
+      // date-specific LM history (the same store the Unified Inventory path
+      // already writes to). Without this, the stacking logic above has
+      // nothing reliable to load as "today's persisted snapshot" the next
+      // time a file is uploaded — it would only work by accident, as long as
+      // NOL3.lmInventory happened to still be sitting in memory unchanged
+      // since the last upload. Any reload, tab suspension, or hub/date
+      // switch in between two uploads would silently lose the first
+      // upload's data, making the second upload look like a replace instead
+      // of a stack.
+      try {
+        const uploadDateForHistory = (typeof getNOL3TodayDate === "function")
+          ? getNOL3TodayDate()
+          : new Date().toISOString().slice(0, 10);
+        await NOL3.saveLMHistorySnapshot(uploadDateForHistory, {
+          fileName: NOL3.lmInventory.fileName,
+          headers: baseInventory.headers,
+          rows: baseInventory.rows,
+          loadedAt: NOL3.lmInventory.loadedAt
+        }, allFiles);
+      } catch (historyError) {
+        console.warn("NOL3: Could not save LM history snapshot after upload.", historyError);
+      }
+
       // Any upload changes the active snapshot, so discard the cached volume
       // for the selected hub/business date and recalculate from the new data.
       try {
