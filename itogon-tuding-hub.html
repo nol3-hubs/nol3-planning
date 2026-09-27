@@ -2461,7 +2461,8 @@ const NOL3_FIXED_HUB_NAME = "Itogon-Tuding Hub";
       const planningKeys = [
         "nol3_planning_layout_v1",
         "nol3_fleet_productivity_v1",
-        "nol3_planning_exceptions_v1"
+        "nol3_planning_exceptions_v1",
+        "nol3_fleet_overview_v1"
       ];
       planningKeys.forEach(base => NOL3Storage.remove(`${base}:${cleanName || "__NO_HUB__"}`));
 
@@ -10171,7 +10172,8 @@ NOL3.pages.riders = function (root) {
       zoneOverrides: overrideStore[hub] || {},
       zoneSettings: zoneSettingsStore[hub] || {},
       frozenTodayVolume: NOL3Storage.get("nol3_frozen_today_volume_v1") || "",
-      weeklyDailySummary: NOL3Storage.get(`NOL3_WEEKLY_DAILY_SUMMARY_${hub}`) || ""
+      weeklyDailySummary: NOL3Storage.get(`NOL3_WEEKLY_DAILY_SUMMARY_${hub}`) || "",
+      fleetOverview: parseObject(NOL3Storage.get("nol3_fleet_overview_v1:" + hub), {})
     };
   }
 
@@ -10181,6 +10183,9 @@ NOL3.pages.riders = function (root) {
     try {
       if (state.businessDate) NOL3Storage.set("nol3_business_day_date_v1", String(state.businessDate));
       if (state.businessDaySettings) NOL3Storage.set("nol3_business_day_settings_v1", String(state.businessDaySettings));
+      if (state.fleetOverview && typeof state.fleetOverview === "object") {
+        NOL3Storage.set("nol3_fleet_overview_v1:" + HUB_NAME, JSON.stringify(state.fleetOverview));
+      }
       if (state.fleetProductivity !== undefined && state.fleetProductivity !== "") {
         NOL3Storage.set("nol3_fleet_productivity_v1:" + HUB_NAME, String(state.fleetProductivity));
       }
@@ -10674,6 +10679,546 @@ NOL3.pages.riders = function (root) {
     if (applyingRemote || event?.detail?.source === "cloud") return;
     schedulePushCheck(filesChannel, () => syncFiles(true));
   });
+})();
+</script>
+
+
+<style id="fleet-overview-styles">
+  .fleet-overview-page{
+    display:flex;
+    flex-direction:column;
+    gap:36px;
+    padding:4px 2px 32px;
+  }
+  .fleet-overview-head{
+    display:flex;
+    justify-content:space-between;
+    align-items:flex-end;
+    gap:18px;
+    flex-wrap:wrap;
+    padding:2px 2px 0;
+  }
+  .fleet-overview-title{
+    margin:0;
+    font-size:26px;
+    line-height:1.1;
+    font-weight:800;
+    letter-spacing:-.025em;
+    color:#0f172a;
+  }
+  .fleet-overview-subtitle{
+    margin-top:6px;
+    color:#64748b;
+    font-size:13px;
+  }
+  .fleet-overview-actions{display:flex;gap:10px;align-items:center}
+  .fleet-overview-btn{
+    border:1px solid #dbe2ea;
+    background:#fff;
+    color:#334155;
+    border-radius:9px;
+    padding:8px 12px;
+    font-weight:700;
+    cursor:pointer;
+    transition:background .15s ease,border-color .15s ease,box-shadow .15s ease;
+  }
+  .fleet-overview-btn:hover{background:#f8fafc;border-color:#cbd5e1;box-shadow:0 1px 3px rgba(15,23,42,.05)}
+  .fleet-overview-card{
+    background:#fff;
+    border:1px solid #e2e8f0;
+    border-radius:14px;
+    box-shadow:0 2px 10px rgba(15,23,42,.045);
+    overflow:hidden;
+  }
+  /* UI-only: keep KPI compact while allowing it to span the full content width. */
+  #page-fleet-overview > .fleet-overview-card:first-of-type{
+    width:100%;
+    margin-inline:0;
+  }
+  #page-fleet-overview > .fleet-overview-card:first-of-type .fleet-overview-card-head{
+    justify-content:center;
+    text-align:center;
+  }
+  #page-fleet-overview > .fleet-overview-card:first-of-type .fleet-overview-card-note{
+    display:none;
+  }
+  .fleet-overview-card-head{
+    padding:10px 14px;
+    border-bottom:1px solid #edf1f5;
+    display:flex;
+    justify-content:space-between;
+    align-items:center;
+    gap:12px;
+    background:linear-gradient(to bottom,#fff,#fcfdff);
+  }
+  .fleet-overview-card-title{
+    font-size:13px;
+    font-weight:800;
+    color:#0f172a;
+    letter-spacing:.01em;
+  }
+  .fleet-overview-card-note{
+    font-size:11px;
+    color:#64748b;
+    text-align:right;
+  }
+  .fleet-overview-table-wrap{
+    overflow:auto;
+    scrollbar-width:thin;
+  }
+  .fleet-overview-table{
+    width:100%;
+    border-collapse:separate;
+    border-spacing:0;
+    min-width:980px;
+    font-size:12px;
+    color:#1e293b;
+  }
+  .fleet-overview-table th,
+  .fleet-overview-table td{
+    padding:10px 12px;
+    border-bottom:1px solid #edf1f5;
+    vertical-align:middle;
+    white-space:nowrap;
+  }
+  .fleet-overview-table th{
+    position:sticky;
+    top:0;
+    z-index:1;
+    background:#f8fafc;
+    font-weight:800;
+    color:#475569;
+    text-align:center;
+    font-size:11px;
+    letter-spacing:.02em;
+    text-transform:none;
+  }
+  .fleet-overview-table th.left,.fleet-overview-table td.left{text-align:left}
+  .fleet-overview-table td.num{
+    text-align:center;
+    font-variant-numeric:tabular-nums;
+  }
+  .fleet-overview-table tbody tr:not(.fleet-overview-total):hover td{background:#f8fbff}
+  .fleet-overview-table tbody tr:last-child td{border-bottom:0}
+  .fleet-overview-total td{
+    font-weight:800;
+    background:#f8fafc;
+    border-top:1px solid #dbe3ec;
+    border-bottom:0;
+    color:#0f172a;
+  }
+  /* UI-only: keep In Transit values at normal weight, including totals. */
+  .fleet-overview-table td.fleet-overview-in-transit{
+    font-weight:400 !important;
+  }
+  .fleet-overview-input{
+    width:78px;
+    border:1px solid #d9c369;
+    background:#fff9df;
+    color:#1f2937;
+    border-radius:8px;
+    padding:6px 8px;
+    text-align:center;
+    font:inherit;
+    font-weight:700;
+    box-sizing:border-box;
+  }
+  .fleet-overview-input:focus{
+    outline:3px solid rgba(59,130,246,.12);
+    border-color:#94a3b8;
+    background:#fffef3;
+  }
+  .fleet-overview-kpi-grid{
+    display:grid;
+    grid-template-columns:minmax(0,1.65fr) minmax(135px,1fr) minmax(135px,1fr) minmax(135px,1fr);
+    align-items:stretch;
+    background:#f8fafc;
+    border-bottom:1px solid #edf1f5;
+  }
+  .fleet-overview-kpi-grid>div:first-child{visibility:hidden}
+  .fleet-overview-kpi-grid>div:last-child{display:none}
+  .fleet-overview-kpi-label{
+    padding:5px 10px;
+    border-right:1px solid #eef1f5;
+    background:#fbfcfe;
+    font-weight:800;
+    color:#334155;
+  }
+  .fleet-overview-kpi-col{
+    padding:5px 10px;
+    text-align:center;
+    font-variant-numeric:tabular-nums;
+  }
+  .fleet-overview-kpi-head{
+    padding:5px 10px;
+    background:#f8fafc;
+    border-right:1px solid #edf1f5;
+    font-weight:800;
+    text-align:center;
+    display:flex;
+    align-items:center;
+    justify-content:center;
+    font-size:11px;
+    color:#64748b;
+  }
+  .fleet-overview-kpi-head:last-child{border-right:0}
+  .fleet-overview-kpi-body{display:grid;grid-template-rows:repeat(3,1fr)}
+  #page-fleet-overview .fleet-overview-kpi-row{min-height:36px;}
+  .fleet-overview-kpi-row{
+    display:grid;
+    grid-template-columns:minmax(0,1.65fr) minmax(135px,1fr) minmax(135px,1fr) minmax(135px,1fr);
+    border-bottom:1px solid #eef1f5;
+    background:#fff;
+  }
+  .fleet-overview-kpi-row:last-child{border-bottom:0}
+  .fleet-overview-kpi-row:hover{background:#fcfdff}
+  .fleet-overview-kpi-value{font-weight:800;color:#0f172a}
+  .fleet-overview-rate{font-weight:800;color:#334155}
+  .fleet-overview-kpi-editor-wrap{
+    display:inline-flex;
+    align-items:center;
+    gap:5px;
+    justify-content:center;
+  }
+  .fleet-overview-kpi-editor-wrap>span{font-weight:700;color:#64748b}
+  .fleet-overview-kpi-editor{
+    width:72px;
+    border:1px solid #d9c369;
+    background:#fff9df;
+    color:#1f2937;
+    border-radius:8px;
+    padding:3px 5px;
+    text-align:center;
+    font:inherit;
+    font-weight:700;
+    box-sizing:border-box;
+  }
+  .fleet-overview-kpi-editor:focus{
+    outline:3px solid rgba(59,130,246,.12);
+    border-color:#94a3b8;
+    background:#fffef3;
+  }
+  .fleet-overview-empty{padding:34px;text-align:center;color:#64748b}
+  .fleet-overview-muted{color:#94a3b8}
+  .fleet-overview-chip{
+    display:inline-flex;
+    align-items:center;
+    padding:6px 10px;
+    border-radius:999px;
+    background:#eef2ff;
+    color:#3730a3;
+    border:1px solid #e0e7ff;
+    font-weight:800;
+    font-size:12px;
+  }
+  #page-fleet-overview .fleet-overview-table td:nth-child(2){font-weight:600;color:#334155}
+  #page-fleet-overview .fleet-overview-table td:nth-child(5),
+  #page-fleet-overview .fleet-overview-table td:last-child{font-weight:800;color:#0f172a}
+  @media (max-width:1100px){
+    .fleet-overview-kpi-grid,
+    .fleet-overview-kpi-row{grid-template-columns:1.65fr repeat(3,1fr)}
+    .fleet-overview-kpi-col,
+    .fleet-overview-kpi-head,
+    .fleet-overview-kpi-label{padding-left:10px;padding-right:10px}
+  }
+  @media (max-width:760px){
+    .fleet-overview-page{gap:24px}
+    .fleet-overview-card-head{align-items:flex-start;flex-direction:column}
+    .fleet-overview-card-note{text-align:left}
+    .fleet-overview-title{font-size:22px}
+  }
+</style>
+<style id="fleet-overview-kpi-header-left-adjustment">
+  /* Keep the KPI card heading on the left; preserve the centered table header below. */
+  #page-fleet-overview > .fleet-overview-card:first-of-type .fleet-overview-card-title{
+    text-align:left !important;
+    justify-content:flex-start !important;
+  }
+</style>
+
+
+<script id="fleet-overview-module">
+(function(){
+  const PAGE = 'fleetoverview';
+  const HUB_KEY = () => String((NOL3.getState && NOL3.getState().selectedHub) || '');
+  const SIM_KEY = () => 'nol3_fleet_overview_v1:' + HUB_KEY();
+
+  const esc = (v) => (typeof NOL3.escapeHTML === 'function') ? NOL3.escapeHTML(String(v ?? '')) : String(v ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+  const norm = (v) => String(v ?? '').replace(/^\uFEFF/, '').trim();
+  const nrm = (v) => norm(v).toLowerCase();
+  const num = (v) => Number(v || 0) || 0;
+
+  function parseCSV(text){
+    const rows=[]; let row=[]; let value=''; let quotes=false;
+    text=String(text||'');
+    for(let i=0;i<text.length;i++){
+      const ch=text[i];
+      if(quotes){
+        if(ch==='"'){ if(text[i+1]==='"'){value+='"';i++;} else quotes=false; }
+        else value+=ch;
+      }else if(ch==='"') quotes=true;
+      else if(ch===','){row.push(value.trim());value='';}
+      else if(ch==='\n'||ch==='\r'){ if(ch==='\r'&&text[i+1]==='\n')i++; row.push(value.trim());value=''; if(row.some(x=>x!==''))rows.push(row); row=[]; }
+      else value+=ch;
+    }
+    if(value!==''||row.length){row.push(value.trim());if(row.some(x=>x!==''))rows.push(row);}
+    return rows;
+  }
+
+  function activeRiders(){
+    const data=NOL3.riderData; if(!data) return [];
+    const rows=Array.isArray(data.rows)&&Array.isArray(data.headers) && data.headers.length
+      ? [data.headers,...data.rows]
+      : parseCSV(data.rawText||'');
+    if(rows.length<2) return [];
+    const hs=rows[0].map(nrm);
+    const ni=hs.indexOf('driver name'), ii=hs.indexOf('driver id'), si=hs.indexOf('spx status'), vi=hs.indexOf('vehicle type');
+    const out=[], seen=new Set();
+    rows.slice(1).forEach(r=>{
+      const status=si>=0?nrm(r[si]):''; if(status.includes('suspend')) return;
+      const id=ii>=0?norm(r[ii]):''; const name=ni>=0?norm(r[ni]):''; const key=id||name; if(!key||seen.has(key))return;
+      seen.add(key); out.push({id:key,name:name||id,vehicleType:vi>=0?norm(r[vi]):''});
+    });
+    return out;
+  }
+
+  function vehicleBucket(v){
+    const s=nrm(v);
+    if(s.includes('flexi')) return 'flexi';
+    if(/(^|[^0-9])4\s*w|4wh|four.?wheel/.test(s)) return '4w';
+    if(/(^|[^0-9])3\s*w|3wl|3wc|three.?wheel/.test(s)) return '3w';
+    if(/(^|[^0-9])2\s*w|2wh|two.?wheel|motor/.test(s)) return '2w';
+    return 'other';
+  }
+
+  function riderLookup(){
+    const map=new Map(); activeRiders().forEach(r=>{map.set(norm(r.id),r);map.set(norm(r.name),r);}); return map;
+  }
+
+  function townCounts(){
+    const lm=NOL3.lmInventory; const out=new Map();
+    if(!lm?.filteredRows?.length||!Array.isArray(lm.headers))return out;
+    const hs=lm.headers.map(nrm);
+    const ti=hs.indexOf('town name'); if(ti<0)return out;
+    lm.filteredRows.forEach(r=>{const town=norm(r[ti]);if(town)out.set(town,(out.get(town)||0)+1);});
+    return out;
+  }
+
+  function splitTownKey(key){
+    const prefix='__NOL3_ZONE_TOWN__'; if(!String(key||'').startsWith(prefix))return {town:norm(key),area:''};
+    const body=String(key).slice(prefix.length); const parts=body.split('::');
+    if(parts.length<2)return {town:norm(key),area:''};
+    try{return {town:decodeURIComponent(parts[0]),area:decodeURIComponent(parts.slice(1).join('::'))};}catch(e){return {town:norm(key),area:''};}
+  }
+
+  function areaVolume(area, counts){
+    const groups=Array.isArray(area?.groups)?area.groups:[]; let total=0;
+    groups.forEach(g=>{(Array.isArray(g.towns)?g.towns:[]).forEach(key=>{const p=splitTownKey(key); total += num(counts.get(p.town));});});
+    return total;
+  }
+
+  function inTransitTownCounts(){
+    const incoming=NOL3.incomingInventory, linehaul=NOL3.lineHaulInventory; const result=new Map();
+    if(!incoming?.rows?.length||!linehaul?.rows?.length)return result;
+    const ih=incoming.headers||[], lh=linehaul.headers||[];
+    const find=(headers,cands)=>{const hs=headers.map(nrm); for(const c of cands){const i=hs.indexOf(nrm(c));if(i>=0)return i;} return -1;};
+    const orderI=find(ih,['Order ID','Order Id','OrderID','SPX TN','SPX Tracking Number','SLS TN','SLS Tracking Number','Tracking Number']);
+    const townI=find(ih,['Town Name','Town','Municipality','Destination Town','Destination Municipality','Destination City','Receiver Town']);
+    const destI=find(ih,['Destination Station','Destination Station Name','Destination Hub','To Station','To Hub','Destination Station Code']);
+    const taskL=find(lh,['Line Haul Task ID','Linehaul Task ID','Line Haul Task','Linehaul Task','Task ID','Task','Linehaul']);
+    const spxL=find(lh,['SPX TN','SPX Tracking Number','SLS TN','SLS Tracking Number','Tracking Number','Tracking No','Tracking ID']);
+    if([orderI,townI,taskL,spxL].some(i=>i<0))return result;
+    const hub=nrm(HUB_KEY()); const spxTasks=new Map();
+    linehaul.rows.forEach(r=>{const spx=nrm(r[spxL]), task=norm(r[taskL]);if(!spx||!task)return;(spxTasks.get(spx)||spxTasks.set(spx,new Set()).get(spx)).add(task);});
+    const arrived=new Set();
+    try{const raw=NOL3Storage.get('nol3_incoming_arrived_tasks_v1'); const a=JSON.parse(raw||'[]'); if(Array.isArray(a))a.forEach(v=>arrived.add(norm(v)));}catch(e){}
+    incoming.rows.forEach(r=>{if(destI>=0&&hub&&nrm(r[destI])!==hub)return; const id=nrm(r[orderI]), town=norm(r[townI]); if(!id||!town)return; const tasks=spxTasks.get(id);if(!tasks)return; tasks.forEach(task=>{if(arrived.has(task))return;result.set(town,(result.get(town)||0)+1);});});
+    return result;
+  }
+
+  function syncPlanningAssignmentsFromStorage(){
+    try{
+      const raw=NOL3Storage.get('nol3_planning_layout_v1');
+      if(!raw) return;
+      const store=JSON.parse(raw);
+      const hub=HUB_KEY();
+      const saved=Array.isArray(store)
+        ? store
+        : (store && store.byHub && Array.isArray(store.byHub[hub]) ? store.byHub[hub] : null);
+      if(!Array.isArray(saved) || !Array.isArray(NOL3.deliveryAreas)) return;
+      const savedById=new Map(saved.map(a=>[String(a?.id||''),a]));
+      NOL3.deliveryAreas.forEach(area=>{
+        const sa=savedById.get(String(area?.id||''));
+        if(!sa || !Array.isArray(sa.groups)) return;
+        area.groups=sa.groups.map(g=>({
+          id:g?.id,
+          title:g?.title||'Town Group',
+          towns:Array.isArray(g?.towns)?g.towns.slice():[],
+          assignedRiders:Array.isArray(g?.assignedRiders)?g.assignedRiders.map(String):[]
+        }));
+        area.towns=area.groups.flatMap(g=>g.towns);
+      });
+    }catch(e){}
+  }
+
+  function allocateEvenly(total, ids){
+    const unique=[...new Set((ids||[]).map(norm).filter(Boolean))];
+    const out=new Map();
+    if(!unique.length)return out;
+    const whole=Math.floor(Math.max(0,Number(total)||0)/unique.length);
+    let remainder=Math.max(0,Number(total)||0)-whole*unique.length;
+    unique.forEach(id=>{const extra=remainder>0?1:0; if(remainder>0)remainder-=1; out.set(id,whole+extra);});
+    return out;
+  }
+
+  function clusterRows(){
+    syncPlanningAssignmentsFromStorage();
+    const areas=Array.isArray(NOL3.deliveryAreas)?NOL3.deliveryAreas:[];
+    const floor=townCounts(), transit=inTransitTownCounts(), rmap=riderLookup();
+    const rows=[];
+    // Show only clusters that actually exist in the current Planning setup.
+    // Do not pad the table with placeholder A-J / N/A rows.
+    areas.filter(Boolean).forEach((area, i)=>{
+      let onFloor=0,inT=0; const riderIds=[]; const actual={two:0,three:0,four:0,flexi:0,total:0};
+      const riderDetails=new Map();
+      (Array.isArray(area.groups)?area.groups:[]).forEach(g=>{
+        let groupFloor=0, groupTransit=0;
+        (Array.isArray(g.towns)?g.towns:[]).forEach(key=>{const p=splitTownKey(key);groupFloor+=num(floor.get(p.town));groupTransit+=num(transit.get(p.town));});
+        onFloor+=groupFloor;
+        inT+=groupTransit;
+
+        const groupRiders=[...new Set((Array.isArray(g.assignedRiders)?g.assignedRiders:[]).map(id=>norm(id)).filter(id=>id&&rmap.has(id)))];
+        const floorShare=allocateEvenly(groupFloor,groupRiders);
+        const transitShare=allocateEvenly(groupTransit,groupRiders);
+        groupRiders.forEach(id=>{
+          const rider=rmap.get(id); if(!rider)return;
+          riderIds.push(rider.id);
+          const b=vehicleBucket(rider.vehicleType);
+          if(b==='2w')actual.two++;else if(b==='3w')actual.three++;else if(b==='4w')actual.four++;else if(b==='flexi')actual.flexi++;
+          actual.total++;
+          const existing=riderDetails.get(id)||{id:rider.id,onFloor:0,inTransit:0};
+          existing.onFloor+=floorShare.get(id)||0;
+          existing.inTransit+=transitShare.get(id)||0;
+          riderDetails.set(id,existing);
+        });
+      });
+      rows.push({cluster:String.fromCharCode(65+i),name:norm(area.title)||'Delivery Area '+(i+1),onFloor,inTransit:inT,total:onFloor+inT,actual,riderIds:[...new Set(riderIds)],riderDetails:[...riderDetails.values()]});
+    });
+    return rows;
+  }
+
+  function loadSim(){
+    try{const raw=NOL3Storage.get(SIM_KEY()); const obj=JSON.parse(raw||''); if(obj&&typeof obj==='object')return obj;}catch(e){}
+    return {};
+  }
+  function saveSim(sim){
+    try{NOL3Storage.set(SIM_KEY(),JSON.stringify(sim)); window.dispatchEvent(new CustomEvent('planningchanged',{detail:{type:'fleet-overview',source:'local'}}));}catch(e){}
+  }
+
+  function targetFP(){
+    const hub=HUB_KEY(); let v=''; try{v=NOL3Storage.get('nol3_fleet_productivity_v1:'+hub)||NOL3Storage.get('nol3_fleet_productivity_v1')||'';}catch(e){}
+    const n=Number(v); return Number.isFinite(n)&&n>0?n:50;
+  }
+
+  function render(root){
+    const rows=clusterRows(); const sim=loadSim(); const riders=activeRiders();
+    const total=rows.reduce((s,r)=>s+r.total,0);
+    const actual=rows.reduce((a,r)=>({two:a.two+r.actual.two,three:a.three+r.actual.three,four:a.four+r.actual.four,flexi:a.flexi+r.actual.flexi,total:a.total+r.actual.total}),{two:0,three:0,four:0,flexi:0,total:0});
+    const defaults={}; rows.forEach(r=>{defaults[r.cluster]={two:r.actual.two,three:r.actual.three,four:r.actual.four,flexi:r.actual.flexi,flexiQty:0};});
+    const current={...defaults,...sim};
+    const simTotal=rows.reduce((sum,r)=>sum+num(current[r.cluster]?.two)+num(current[r.cluster]?.three)+num(current[r.cluster]?.four)+num(current[r.cluster]?.flexi),0);
+    const sim4=rows.reduce((sum,r)=>sum+num(current[r.cluster]?.four),0);
+    const simProd=simTotal>0?total/simTotal:0; const actualProd=actual.total>0?total/actual.total:0;
+    const fpTarget=targetFP();
+    const simFP=fpTarget>0?simProd/fpTarget*100:0; const actualFP=fpTarget>0?actualProd/fpTarget*100:0;
+    // 4WH Usage is a ratio (for example 0.50), not a percentage.
+    // Migrate the previous percentage-based saved value when necessary.
+    let saved4Usage=Number(sim.kpi4whUsageTarget);
+    if(!Number.isFinite(saved4Usage)){
+      const legacy4=Number(sim.kpi4whUsageTargetPct);
+      saved4Usage=Number.isFinite(legacy4)?(legacy4>1?legacy4/100:legacy4):0.5;
+    }
+    if(saved4Usage>1 && saved4Usage<=100) saved4Usage=saved4Usage/100;
+    const fourTarget=Math.max(0,saved4Usage);
+    const sim4Usage=simTotal>0?sim4/simTotal:0; const actual4Usage=actual.total>0?actual.four/actual.total:0;
+    const inv=(x,t)=>t>0?Math.max(0,Math.min(100,(1-x/t)*100)):100;
+    const currentSR=riders.length?actual.total/riders.length*100:0;
+    const savedSRTarget=Number(sim.kpiCurrentSRTargetPct);
+    const currentSRTargetPct=Number.isFinite(savedSRTarget)&&savedSRTarget>=0?savedSRTarget:86.78;
+    const currentSRAchievement=currentSRTargetPct>0?currentSR/currentSRTargetPct*100:0;
+    const allRows=[...rows];
+    root.innerHTML=`
+      <div class="page active fleet-overview-page" id="page-fleet-overview">
+        <div class="fleet-overview-head">
+          <div><h2 class="fleet-overview-title">Fleet Overview</h2><div class="fleet-overview-subtitle">${esc(HUB_KEY()||'No hub selected')} · live planning snapshot</div></div>
+          <div class="fleet-overview-actions"><span class="fleet-overview-chip">${total.toLocaleString()} volume</span></div>
+        </div>
+
+        <section class="fleet-overview-card">
+          <div class="fleet-overview-card-head"><div class="fleet-overview-card-title">KPI</div><div class="fleet-overview-card-note">Targets and actual deployed-driver indicators</div></div>
+          <div class="fleet-overview-kpi-grid">
+            <div></div><div class="fleet-overview-kpi-head">Target To Achieve A+</div><div class="fleet-overview-kpi-head">Actual Number</div><div class="fleet-overview-kpi-head">Achievement Rate</div><div></div>
+          </div>
+          <div class="fleet-overview-kpi-body">
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Allmile Productivity</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverviewFPTarget" type="number" min="1" step="0.01" value="${fpTarget}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${Math.round(actualProd).toLocaleString()}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${((Number(fpTarget)||0)>0?(actualFP/Number(fpTarget))*100:0).toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.total.toLocaleString()} deployed / ${riders.length.toLocaleString()} active</div></div>
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">4WH Usage</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverview4WHTarget" type="number" min="0" step="0.01" value="${fourTarget.toFixed(2)}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${actual4Usage.toFixed(2)}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${inv(actual4Usage,fourTarget).toFixed(0)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">Actual 4WH ratio</div></div>
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Current SR</div><div class="fleet-overview-kpi-col"><span class="fleet-overview-kpi-editor-wrap"><input class="fleet-overview-kpi-editor" id="fleetOverviewSRTarget" type="number" min="0" max="100" step="0.01" value="${currentSRTargetPct}"><span>%</span></span></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value"></div><div class="fleet-overview-kpi-col fleet-overview-rate"></div><div class="fleet-overview-kpi-col fleet-overview-muted"></div></div>
+          </div>
+        </section>
+
+        <section class="fleet-overview-card">
+          <div class="fleet-overview-card-head"><div class="fleet-overview-card-title">Volume Per Cluster</div><div class="fleet-overview-card-note">On floor + in transit, grouped from current planning areas</div></div>
+          <div class="fleet-overview-table-wrap"><table class="fleet-overview-table"><thead><tr><th class="left">Cluster</th><th class="left">Name</th><th>Volume On Floor</th><th>Volume In Transit</th><th>Total Volume</th><th>2W</th><th>3W</th><th>4W</th><th>Flexi</th><th>Total</th></tr></thead><tbody>
+          ${allRows.map(r=>`<tr><td class="left">${r.cluster}</td><td class="left">${esc(r.name)}</td><td class="num">${r.onFloor.toLocaleString()}</td><td class="num fleet-overview-in-transit">${r.inTransit.toLocaleString()}</td><td class="num"><b>${r.total.toLocaleString()}</b></td><td class="num">${r.actual.two||''}</td><td class="num">${r.actual.three||''}</td><td class="num">${r.actual.four||''}</td><td class="num">${r.actual.flexi||''}</td><td class="num"><b>${r.actual.total||0}</b></td></tr>`).join('')}
+          <tr class="fleet-overview-total"><td colspan="2" class="left">TOTAL</td><td class="num">${rows.reduce((s,r)=>s+r.onFloor,0).toLocaleString()}</td><td class="num fleet-overview-in-transit">${rows.reduce((s,r)=>s+r.inTransit,0).toLocaleString()}</td><td class="num">${total.toLocaleString()}</td><td class="num">${actual.two||0}</td><td class="num">${actual.three||0}</td><td class="num">${actual.four||0}</td><td class="num">${actual.flexi||0}</td><td class="num">${actual.total||0}</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section class="fleet-overview-card">
+          <div class="fleet-overview-card-head"><div class="fleet-overview-card-title">List of Deployed Riders</div><div class="fleet-overview-card-note">Parcel volume is distributed evenly among riders assigned to each Town Group</div></div>
+          <div class="fleet-overview-table-wrap"><table class="fleet-overview-table"><thead><tr><th class="left">Rider</th><th class="left">Fleet Type</th><th class="left">Cluster</th><th class="num">Parcels on Floor</th><th class="num">In Transit</th><th class="num">Total</th></tr></thead><tbody>
+          ${(()=>{const rmap=riderLookup(); const seen=new Set(); const body=[]; let floorTotal=0,inTransitTotal=0; const fleetCounts={}; rows.forEach(r=>r.riderDetails.forEach(d=>{const id=norm(d.id);if(seen.has(id))return;seen.add(id);const rd=rmap.get(id);const fleet=String(rd?.vehicleType||'').trim()||'Unspecified'; const floor=Number(d.onFloor||0);const transit=Number(d.inTransit||0);const riderTotal=floor+transit;floorTotal+=floor;inTransitTotal+=transit;fleetCounts[fleet]=(fleetCounts[fleet]||0)+1;body.push(`<tr><td class="left">${esc(rd?.name||d.id)}</td><td class="left">${esc(fleet)}</td><td class="left">${r.cluster} · ${esc(r.name)}</td><td class="num">${floor.toLocaleString()}</td><td class="num fleet-overview-in-transit">${transit.toLocaleString()}</td><td class="num"><b>${riderTotal.toLocaleString()}</b></td></tr>`);})); if(!body.length)return `<tr><td colspan="6" class="fleet-overview-empty">No riders are assigned to planning groups yet.</td></tr>`; const fleetSummary=Object.entries(fleetCounts).sort((a,b)=>a[0].localeCompare(b[0])).map(([type,count])=>`${esc(type)}: ${count.toLocaleString()}`).join(' · '); return body.join('')+`<tr class="fleet-overview-total"><td class="left">TOTAL RIDERS: ${seen.size.toLocaleString()}</td><td class="left">${fleetSummary||'—'}</td><td></td><td class="num">${floorTotal.toLocaleString()}</td><td class="num fleet-overview-in-transit">${inTransitTotal.toLocaleString()}</td><td class="num">${(floorTotal+inTransitTotal).toLocaleString()}</td></tr>`;})()}
+          </tbody></table></div>
+        </section>
+      </div>`;
+
+    root.querySelector('#fleetOverviewFPTarget')?.addEventListener('change',e=>{const v=Math.max(1,Number(e.target.value)||50);try{NOL3Storage.set('nol3_fleet_productivity_v1:'+HUB_KEY(),String(v));}catch(_){ } window.dispatchEvent(new CustomEvent('planningchanged',{detail:{type:'fleet-productivity',source:'local'}})); render(root);});
+    root.querySelector('#fleetOverview4WHTarget')?.addEventListener('change',e=>{const obj=loadSim(); const v=Number(e.target.value); obj.kpi4whUsageTarget=Number.isFinite(v)?Math.max(0,v):0.5; delete obj.kpi4whUsageTargetPct; saveSim(obj); render(root);});
+    root.querySelector('#fleetOverviewSRTarget')?.addEventListener('change',e=>{const obj=loadSim(); obj.kpiCurrentSRTargetPct=Math.max(0,Math.min(100,Number(e.target.value)||0)); saveSim(obj); render(root);});
+  }
+
+  const originalPage=NOL3.renderPage;
+  NOL3.pages=NOL3.pages||{};
+  NOL3.pages.fleetoverview=function(root){render(root);};
+  NOL3.renderPage=function(page){
+    if(page===PAGE){
+      const root=document.getElementById('app-content'); const state=NOL3.getState(); state.currentPage=PAGE; root.innerHTML='';
+      document.querySelectorAll('.nav-item').forEach(b=>b.classList.toggle('active',b.dataset.page===PAGE));
+      return NOL3.pages.fleetoverview(root);
+    }
+    return originalPage(page);
+  };
+
+  const originalSidebar=NOL3.renderSidebar;
+  NOL3.renderSidebar=function(){
+    originalSidebar();
+    const nav=document.querySelector('#sidebar .nav'); if(!nav)return;
+    const current=NOL3.getState().currentPage;
+    const btn=document.createElement('button'); btn.className='nav-item'+(current===PAGE?' active':''); btn.dataset.page=PAGE; btn.innerHTML='<span class="nav-icon">▦</span><span class="nav-label">Fleet Overview</span>';
+    btn.addEventListener('click',()=>{if(typeof NOL3.syncBusinessDateFromDom==='function')NOL3.syncBusinessDateFromDom();NOL3.setCurrentPage(PAGE);NOL3.renderSidebar();NOL3.renderTopbar();NOL3.renderPage(PAGE);});
+    const inventoryBtn=nav.querySelector('.nav-item[data-page="inventory"]');
+    if (inventoryBtn) inventoryBtn.insertAdjacentElement('afterend',btn);
+    else nav.appendChild(btn);
+  };
+
+  const originalTopbar=NOL3.renderTopbar;
+  NOL3.renderTopbar=function(){originalTopbar();if(NOL3.getState().currentPage===PAGE){const t=document.querySelector('#topbar .page-title');if(t)t.textContent='Fleet Overview';}};
+
+  const rerender=()=>{if(NOL3.getState?.().currentPage===PAGE){const root=document.getElementById('app-content');if(root)render(root);}};
+  ['inventoryloaded','planningchanged','hubchange','lminventoryfiltered'].forEach(ev=>window.addEventListener(ev,()=>setTimeout(rerender,0)));
+
+  if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>{try{NOL3.renderSidebar();NOL3.renderTopbar();NOL3.renderPage(NOL3.getState().currentPage);}catch(e){console.warn('Fleet Overview initialization failed',e);}});
+  else{try{NOL3.renderSidebar();NOL3.renderTopbar();NOL3.renderPage(NOL3.getState().currentPage);}catch(e){console.warn('Fleet Overview initialization failed',e);}}
 })();
 </script>
 </body>
