@@ -10228,6 +10228,158 @@ NOL3.pages.riders = function (root) {
     try { return JSON.stringify(value); } catch (_) { return String(Date.now()); }
   }
 
+  // ===== PROVIDER SWITCH =====
+  // Hub data lives in Supabase and is mirrored to Firebase Realtime Database.
+  // cloud-config.json (next to the hub pages on GitHub) decides who is active:
+  //   { "provider": "supabase" | "firebase" | "auto",
+  //     "firebaseUrl": "https://<db>.firebasedatabase.app",
+  //     "mirror": true,
+  //     "hubs": { "BAUKO": "firebase" } }      <- optional per-hub override
+  // "auto" = Supabase, but a quota/limit error moves this device to Firebase
+  // for 6 hours. With no firebaseUrl set, everything behaves as before.
+  const CFG_KEY = "NOL3_CLOUD_CFG";
+  const FAILOVER_KEY = `NOL3_CLOUD_FAILOVER_${HUB_CODE}`;
+  const FAILOVER_MS = 6 * 3600 * 1000;
+  let cloudCfg = (() => { try { return JSON.parse(localStorage.getItem(CFG_KEY) || "null") || {}; } catch (_) { return {}; } })();
+  let cfgLoadedAt = 0;
+  let lastActive = "";
+
+  function wantedProvider() {
+    return String((cloudCfg.hubs && cloudCfg.hubs[HUB_CODE]) || cloudCfg.provider || "supabase").toLowerCase();
+  }
+  function activeProvider() {
+    try {
+      const want = wantedProvider();
+      if (!cloudCfg.firebaseUrl) return "supabase";
+      if (want === "firebase") return "firebase";
+      if (want === "auto" && Date.now() < Number(localStorage.getItem(FAILOVER_KEY) || 0)) return "firebase";
+    } catch (_) {}
+    return "supabase";
+  }
+  function mirrorName() {
+    if (!cloudCfg.firebaseUrl || cloudCfg.mirror === false) return null;
+    return activeProvider() === "supabase" ? "firebase" : "supabase";
+  }
+
+  const sbRaw = {
+    async readStamps() {
+      const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&select=data_type,updated_at`);
+      const map = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => { map[r.data_type] = Date.parse(r.updated_at) || 0; });
+      return map;
+    },
+    async readRow(dataType) {
+      const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(dataType)}&select=data,updated_at&limit=1`);
+      return Array.isArray(rows) && rows.length ? rows[0] : null;
+    },
+    async writeRow(dataType, data, updatedAt) {
+      await api(`hub_data?on_conflict=hub_id,data_type`, {
+        method: "POST",
+        headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
+        body: JSON.stringify({ hub_id: HUB_ID, data_type: dataType, data, updated_at: updatedAt })
+      });
+    }
+  };
+
+  // Firebase layout: hub_stamps/<hub>/<type> = updated_at (tiny, polled),
+  // hub_data/<hub>/<type> = { json: "<stringified data>", updated_at }.
+  // Data is stored as a string so Firebase key rules / null / array quirks can't alter it.
+  const fbBase = () => String(cloudCfg.firebaseUrl || "").replace(/\/+$/, "");
+  async function fbFetch(path, options) {
+    const response = await fetch(`${fbBase()}/${path}`, options);
+    const text = await response.text();
+    trackEgress(text.length);
+    if (!response.ok) throw new Error(`${response.status}: ${text || response.statusText}`);
+    return text ? JSON.parse(text) : null;
+  }
+  const fbRaw = {
+    async readStamps() {
+      const obj = await fbFetch(`hub_stamps/${HUB_ID}.json`);
+      const map = {};
+      Object.keys(obj || {}).forEach(k => { map[k] = Date.parse(obj[k]) || 0; });
+      return map;
+    },
+    async readRow(dataType) {
+      const row = await fbFetch(`hub_data/${HUB_ID}/${encodeURIComponent(dataType)}.json`);
+      if (!row || typeof row.json !== "string") return null;
+      return { data: JSON.parse(row.json), updated_at: row.updated_at };
+    },
+    async writeRow(dataType, data, updatedAt) {
+      await fbFetch(`.json?print=silent`, {
+        method: "PATCH",
+        body: JSON.stringify({
+          [`hub_data/${HUB_ID}/${dataType}`]: { json: JSON.stringify(data), updated_at: updatedAt },
+          [`hub_stamps/${HUB_ID}/${dataType}`]: updatedAt
+        })
+      });
+    }
+  };
+
+  function noteBackendError(name, error) {
+    if (name !== "supabase" || wantedProvider() !== "auto" || !cloudCfg.firebaseUrl) return;
+    if (/^(402|429)\b|quota|restricted|exceed/i.test(String(error && error.message))) {
+      try { localStorage.setItem(FAILOVER_KEY, String(Date.now() + FAILOVER_MS)); } catch (_) {}
+      invalidateStamps();
+    }
+  }
+  function wrapBackend(name, raw) {
+    const out = {};
+    ["readStamps", "readRow", "writeRow"].forEach(k => {
+      out[k] = async (...args) => {
+        try { return await raw[k](...args); } catch (e) { noteBackendError(name, e); throw e; }
+      };
+    });
+    return out;
+  }
+  const BACKENDS = { supabase: wrapBackend("supabase", sbRaw), firebase: wrapBackend("firebase", fbRaw) };
+  const backendFor = name => BACKENDS[name] || BACKENDS.supabase;
+  const activeBackend = () => backendFor(activeProvider());
+
+  async function writeRowEverywhere(dataType, data, updatedAt) {
+    await activeBackend().writeRow(dataType, data, updatedAt);           // must succeed
+    const mirror = mirrorName();
+    if (mirror) backendFor(mirror).writeRow(dataType, data, updatedAt).catch(() => {});   // best effort
+  }
+
+  // Newest copy wins, in both directions; at most one attempt per device per day.
+  async function backfillMirror() {
+    const mirror = mirrorName();
+    if (!mirror) return;
+    const key = `NOL3_CLOUD_BACKFILL_${HUB_CODE}`;
+    const token = `${new Date().toISOString().slice(0, 10)}:${activeProvider()}:${fbBase()}`;
+    try { if (localStorage.getItem(key) === token) return; localStorage.setItem(key, token); } catch (_) {}
+    const act = backendFor(activeProvider()), oth = backendFor(mirror);
+    const [a, b] = await Promise.all([act.readStamps(), oth.readStamps()]);
+    for (const dt of new Set([...Object.keys(a), ...Object.keys(b)])) {
+      const sa = a[dt] || 0, sb = b[dt] || 0;
+      if (sa === sb) continue;
+      const [from, to] = sa > sb ? [act, oth] : [oth, act];
+      const row = await from.readRow(dt);
+      if (row && row.data) await to.writeRow(dt, row.data, row.updated_at);
+    }
+  }
+
+  async function loadCloudConfig() {
+    try {
+      const r = await fetch(`cloud-config.json?t=${Math.floor(Date.now() / 300000)}`, { cache: "no-store" });
+      if (r.ok) {
+        const j = await r.json();
+        if (j && typeof j === "object") {
+          cloudCfg = j;
+          try { localStorage.setItem(CFG_KEY, JSON.stringify(j)); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    cfgLoadedAt = Date.now();
+    const now = activeProvider();
+    if (lastActive && now !== lastActive) { invalidateStamps(); backfillMirror().catch(() => {}); }
+    lastActive = now;
+  }
+  async function refreshCloudConfigIfDue() {
+    if (Date.now() - cfgLoadedAt > 300000) await loadCloudConfig();
+  }
+  // ===== /PROVIDER SWITCH =====
+
   // ===== EGRESS GUARD =====
   // 1) Polls ask Supabase only for updated_at (bytes); the big `data` column
   //    is downloaded only when updated_at actually changed.
@@ -10258,7 +10410,8 @@ NOL3.pages.riders = function (root) {
   }
   function egressLabel() {
     const u = readEgress();
-    return u.bytes ? `↓ ${(u.bytes / 1048576).toFixed(u.bytes < 10485760 ? 2 : 1)} MB today` : "↓ 0 MB today";
+    const tag = activeProvider() === "firebase" ? "FIREBASE • " : "";
+    return tag + (u.bytes ? `↓ ${(u.bytes / 1048576).toFixed(u.bytes < 10485760 ? 2 : 1)} MB today` : "↓ 0 MB today");
   }
 
   let stampsCache = { at: 0, promise: null };
@@ -10266,11 +10419,7 @@ NOL3.pages.riders = function (root) {
   function getRemoteStamps(force) {
     const now = Date.now();
     if (!force && stampsCache.promise && now - stampsCache.at < 4000) return stampsCache.promise;
-    const p = api(`hub_data?hub_id=eq.${HUB_ID}&select=data_type,updated_at`).then(rows => {
-      const map = {};
-      (Array.isArray(rows) ? rows : []).forEach(r => { map[r.data_type] = Date.parse(r.updated_at) || 0; });
-      return map;
-    });
+    const p = activeBackend().readStamps();
     stampsCache = { at: now, promise: p };
     p.catch(() => { if (stampsCache.promise === p) invalidateStamps(); });
     return p;
@@ -10278,6 +10427,7 @@ NOL3.pages.riders = function (root) {
 
   async function pollCycle() {
     if (document.hidden) return;
+    await refreshCloudConfigIfDue();
     await syncSettingsAndRoster();
     await syncFiles();
   }
@@ -10353,8 +10503,7 @@ NOL3.pages.riders = function (root) {
   // ===== /PAYLOAD SLIM =====
 
   async function readRemoteFor(channel) {
-    const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(channel.dataType)}&select=data,updated_at&limit=1`);
-    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+    const row = await activeBackend().readRow(channel.dataType);
     if (row && row.data) row.data = await unpackSnapshot(row.data);
     return row;
   }
@@ -10383,11 +10532,7 @@ NOL3.pages.riders = function (root) {
       data: await encodeForUpload(channel, stripNulCharacters(snapshot)),
       updated_at: new Date().toISOString()
     };
-    await api(`hub_data?on_conflict=hub_id,data_type`, {
-      method: "POST",
-      headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
-      body: JSON.stringify(payload)
-    });
+    await writeRowEverywhere(payload.data_type, payload.data, payload.updated_at);
     try {
       invalidateStamps();
       const stamps = await getRemoteStamps(true);
@@ -10728,6 +10873,7 @@ NOL3.pages.riders = function (root) {
     syncNow: syncOnce,
     clearUploadedFilesCloud,
     usage: readEgress,
+    provider: activeProvider,
     hubId: HUB_ID,
     hubName: HUB_NAME,
     hubCode: HUB_CODE
@@ -10759,7 +10905,7 @@ NOL3.pages.riders = function (root) {
         NOL3.currentBusinessDate = today;
         NOL3Storage.set("nol3_business_day_date_v1", today);
       } catch (_) {}
-      initialSync().then(startAdaptivePolling);
+      loadCloudConfig().then(() => initialSync()).then(() => { startAdaptivePolling(); backfillMirror().catch(() => {}); });
     }, 1200);
   });
 
