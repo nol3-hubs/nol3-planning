@@ -10039,11 +10039,9 @@ NOL3.pages.riders = function (root) {
           rowCount: Array.isArray(lm.rows) ? lm.rows.length : 0,
           rawText: typeof lm.rawText === "string" ? lm.rawText : ""
         };
-        if (typeof filterLMForHub === "function") {
-          filterLMForHub(NOL3.lmInventory);
-          // Prefer the cloud-derived filtered snapshot when it is present.
-          if (Array.isArray(lm.filteredRows)) NOL3.lmInventory.filteredRows = lm.filteredRows;
-        }
+        if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory);
+        // Older cloud rows carry filteredRows; new ones don't, so rebuild it.
+        NOL3.lmInventory.filteredRows = Array.isArray(lm.filteredRows) ? lm.filteredRows : deriveFilteredRows(NOL3.lmInventory);
       }
 
       if (data.incomingInventory) {
@@ -10106,7 +10104,7 @@ NOL3.pages.riders = function (root) {
       el.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:99999;padding:8px 12px;border-radius:999px;background:#111827;color:#fff;font:600 12px/1.2 Arial,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.18);opacity:.92;pointer-events:none";
       document.body.appendChild(el);
     }
-    el.textContent = `CLOUD • ${text}`;
+    el.textContent = `CLOUD • ${text} • ${egressLabel()}`;
     el.style.opacity = good === null ? ".92" : good ? "1" : ".78";
   };
 
@@ -10132,6 +10130,7 @@ NOL3.pages.riders = function (root) {
       }
     });
     const text = await response.text();
+    trackEgress(text.length);
     if (!response.ok) throw new Error(`${response.status}: ${text || response.statusText}`);
     return text ? JSON.parse(text) : null;
   };
@@ -10229,9 +10228,135 @@ NOL3.pages.riders = function (root) {
     try { return JSON.stringify(value); } catch (_) { return String(Date.now()); }
   }
 
+  // ===== EGRESS GUARD =====
+  // 1) Polls ask Supabase only for updated_at (bytes); the big `data` column
+  //    is downloaded only when updated_at actually changed.
+  // 2) One tiny request covers all three channels.
+  // 3) No polling while the tab is hidden; slower when nobody is touching it.
+  // 4) A device never re-downloads a snapshot it just pushed itself.
+  const POLL_ACTIVE_MS = 60000;   // tab visible and recently used
+  const POLL_IDLE_MS = 120000;    // tab visible but untouched for 5+ min
+  const IDLE_AFTER_MS = 300000;
+  let lastActivityAt = Date.now();
+  ["pointerdown", "keydown", "touchstart"].forEach(ev =>
+    window.addEventListener(ev, () => { lastActivityAt = Date.now(); }, { passive: true, capture: true }));
+
+  const EGRESS_KEY = `NOL3_CLOUD_EGRESS_${HUB_CODE}`;
+  function readEgress() {
+    const day = new Date().toISOString().slice(0, 10);
+    try {
+      const raw = JSON.parse(localStorage.getItem(EGRESS_KEY) || "{}");
+      return raw.day === day ? raw : { day, bytes: 0, requests: 0 };
+    } catch (_) { return { day, bytes: 0, requests: 0 }; }
+  }
+  function trackEgress(chars) {
+    try {
+      const u = readEgress();
+      u.bytes += chars; u.requests += 1;
+      localStorage.setItem(EGRESS_KEY, JSON.stringify(u));
+    } catch (_) {}
+  }
+  function egressLabel() {
+    const u = readEgress();
+    return u.bytes ? `↓ ${(u.bytes / 1048576).toFixed(u.bytes < 10485760 ? 2 : 1)} MB today` : "↓ 0 MB today";
+  }
+
+  let stampsCache = { at: 0, promise: null };
+  function invalidateStamps() { stampsCache = { at: 0, promise: null }; }
+  function getRemoteStamps(force) {
+    const now = Date.now();
+    if (!force && stampsCache.promise && now - stampsCache.at < 4000) return stampsCache.promise;
+    const p = api(`hub_data?hub_id=eq.${HUB_ID}&select=data_type,updated_at`).then(rows => {
+      const map = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => { map[r.data_type] = Date.parse(r.updated_at) || 0; });
+      return map;
+    });
+    stampsCache = { at: now, promise: p };
+    p.catch(() => { if (stampsCache.promise === p) invalidateStamps(); });
+    return p;
+  }
+
+  async function pollCycle() {
+    if (document.hidden) return;
+    await syncSettingsAndRoster();
+    await syncFiles();
+  }
+  function startAdaptivePolling() {
+    const loop = () => {
+      const idle = Date.now() - lastActivityAt > IDLE_AFTER_MS;
+      setTimeout(async () => {
+        try { await pollCycle(); } catch (_) {}
+        loop();
+      }, idle ? POLL_IDLE_MS : POLL_ACTIVE_MS);
+    };
+    loop();
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) { lastActivityAt = Date.now(); pollCycle().catch(() => {}); }
+    });
+  }
+  // ===== /EGRESS GUARD =====
+
+  // ===== PAYLOAD SLIM =====
+  // The files snapshot used to carry the same rows 3x (rows + rawText +
+  // filteredRows). Receivers never read rawText after a cloud restore and
+  // rebuild filteredRows themselves, so neither is uploaded any more. What is
+  // left is gzip-compressed (base64 inside the existing jsonb column).
+  // Old uncompressed rows are still read fine.
+  function slimFilesSnapshot(s) {
+    if (!s || typeof s !== "object") return s;
+    const out = { ...s };
+    for (const k of ["lmInventory", "incomingInventory", "lineHaulInventory"]) {
+      const v = out[k];
+      if (!v || typeof v !== "object") continue;
+      const c = { ...v };
+      delete c.filteredRows;
+      c.rawText = "";
+      if (Array.isArray(c.files)) c.files = c.files.map(f => (f && typeof f === "object") ? { name: f.name, lastModified: f.lastModified || 0 } : f);
+      out[k] = c;
+    }
+    return out;
+  }
+
+  function deriveFilteredRows(inv) {
+    const hub = String((NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME).trim().toLowerCase();
+    const headers = (inv.headers || []).map(h => String(h || "").trim().toLowerCase());
+    const ci = headers.indexOf("current station");
+    if (ci < 0) return [];
+    return (inv.rows || []).filter(r => String(r?.[ci] ?? "").trim().toLowerCase() === hub);
+  }
+
+  async function packSnapshot(obj) {
+    const json = JSON.stringify(obj);
+    const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"));
+    const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    return { z: 1, clientUpdatedAt: obj.clientUpdatedAt || 0, clearedByUser: obj.clearedByUser === true, gz: btoa(bin) };
+  }
+
+  async function unpackSnapshot(data) {
+    if (!data || data.z !== 1 || typeof data.gz !== "string") return data;   // legacy plain row
+    const bin = atob(data.gz);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text());
+  }
+
+  async function encodeForUpload(channel, data) {
+    if (channel === filesChannel) data = slimFilesSnapshot(data);
+    if (channel !== settingsChannel && typeof CompressionStream === "function") {
+      try { return await packSnapshot(data); } catch (e) { console.warn("NOL3 cloud: compression failed, sending plain", e); }
+    }
+    return data;
+  }
+  // ===== /PAYLOAD SLIM =====
+
   async function readRemoteFor(channel) {
     const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(channel.dataType)}&select=data,updated_at&limit=1`);
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
+    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+    if (row && row.data) row.data = await unpackSnapshot(row.data);
+    return row;
   }
 
   // Postgres/Supabase's jsonb columns reject the \u0000 (NUL) escape sequence
@@ -10255,7 +10380,7 @@ NOL3.pages.riders = function (root) {
     const payload = {
       hub_id: HUB_ID,
       data_type: channel.dataType,
-      data: stripNulCharacters(snapshot),
+      data: await encodeForUpload(channel, stripNulCharacters(snapshot)),
       updated_at: new Date().toISOString()
     };
     await api(`hub_data?on_conflict=hub_id,data_type`, {
@@ -10263,6 +10388,11 @@ NOL3.pages.riders = function (root) {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(payload)
     });
+    try {
+      invalidateStamps();
+      const stamps = await getRemoteStamps(true);
+      channel.lastStamp = stamps[channel.dataType] || 0;
+    } catch (_) {}
   }
 
   async function restoreIndexedDB(records) {
@@ -10338,6 +10468,7 @@ NOL3.pages.riders = function (root) {
 
   async function initialSyncChannel(channel) {
     const remote = await readRemoteFor(channel);
+    channel.lastStamp = remote ? (Date.parse(remote.updated_at) || 0) : 0;
     let local = await channel.buildSnapshot();
     const savedRemoteTime = Number(localStorage.getItem(channel.metaKey) || 0);
 
@@ -10489,7 +10620,12 @@ NOL3.pages.riders = function (root) {
         localStorage.setItem(channel.metaKey, String(channel.lastLocalMutationAt));
       }
 
+      const stamps = await getRemoteStamps();
+      const stamp = stamps[channel.dataType] || 0;
+      if (!stamp || stamp === channel.lastStamp) return false;   // unchanged: no download
+
       const remote = await readRemoteFor(channel);
+      const remoteStamp = remote ? (Date.parse(remote.updated_at) || stamp) : stamp;
       if (remote?.data) {
         const remoteTime = Number(remote.data.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
         if (remoteTime > channel.lastRemoteUpdatedAt && remoteTime > channel.lastLocalMutationAt) {
@@ -10498,9 +10634,11 @@ NOL3.pages.riders = function (root) {
           channel.lastLocalMutationAt = remoteTime;
           localStorage.setItem(channel.metaKey, String(remoteTime));
           channel.lastHash = stableHash(await channel.buildSnapshot());
+          channel.lastStamp = remoteStamp;
           return true;
         }
       }
+      channel.lastStamp = remoteStamp;
       return false;
     } finally {
       channel.syncing = false;
@@ -10589,6 +10727,7 @@ NOL3.pages.riders = function (root) {
   window.NOL3CloudSync = {
     syncNow: syncOnce,
     clearUploadedFilesCloud,
+    usage: readEgress,
     hubId: HUB_ID,
     hubName: HUB_NAME,
     hubCode: HUB_CODE
@@ -10620,10 +10759,7 @@ NOL3.pages.riders = function (root) {
         NOL3.currentBusinessDate = today;
         NOL3Storage.set("nol3_business_day_date_v1", today);
       } catch (_) {}
-      initialSync().then(() => {
-        setInterval(syncSettingsAndRoster, settingsChannel.pollMs);
-        setInterval(syncFiles, filesChannel.pollMs);
-      });
+      initialSync().then(startAdaptivePolling);
     }, 1200);
   });
 
@@ -11079,7 +11215,7 @@ NOL3.pages.riders = function (root) {
     // Show only clusters that actually exist in the current Planning setup.
     // Do not pad the table with placeholder A-J / N/A rows.
     areas.filter(Boolean).forEach((area, i)=>{
-      let onFloor=0,inT=0; const riderIds=[]; const actual={two:0,three:0,four:0,flexi:0,total:0};
+      let onFloor=0,inT=0; const riderIds=[]; const actual={two:0,three:0,four:0,flexi:0,total:0,regular:0};
       const riderDetails=new Map();
       (Array.isArray(area.groups)?area.groups:[]).forEach(g=>{
         let groupFloor=0, groupTransit=0;
@@ -11096,6 +11232,7 @@ NOL3.pages.riders = function (root) {
           const b=vehicleBucket(rider.vehicleType);
           if(b==='2w')actual.two++;else if(b==='3w')actual.three++;else if(b==='4w')actual.four++;else if(b==='flexi')actual.flexi++;
           actual.total++;
+          if(b==='2w'||b==='3w'||b==='4w')actual.regular++;
           const existing=riderDetails.get(id)||{id:rider.id,onFloor:0,inTransit:0};
           existing.onFloor+=floorShare.get(id)||0;
           existing.inTransit+=transitShare.get(id)||0;
@@ -11123,12 +11260,12 @@ NOL3.pages.riders = function (root) {
   function render(root){
     const rows=clusterRows(); const sim=loadSim(); const riders=activeRiders();
     const total=rows.reduce((s,r)=>s+r.total,0);
-    const actual=rows.reduce((a,r)=>({two:a.two+r.actual.two,three:a.three+r.actual.three,four:a.four+r.actual.four,flexi:a.flexi+r.actual.flexi,total:a.total+r.actual.total}),{two:0,three:0,four:0,flexi:0,total:0});
+    const actual=rows.reduce((a,r)=>({two:a.two+r.actual.two,three:a.three+r.actual.three,four:a.four+r.actual.four,flexi:a.flexi+r.actual.flexi,regular:a.regular+r.actual.regular,total:a.total+r.actual.total}),{two:0,three:0,four:0,flexi:0,regular:0,total:0});
     const defaults={}; rows.forEach(r=>{defaults[r.cluster]={two:r.actual.two,three:r.actual.three,four:r.actual.four,flexi:r.actual.flexi,flexiQty:0};});
     const current={...defaults,...sim};
     const simTotal=rows.reduce((sum,r)=>sum+num(current[r.cluster]?.two)+num(current[r.cluster]?.three)+num(current[r.cluster]?.four)+num(current[r.cluster]?.flexi),0);
     const sim4=rows.reduce((sum,r)=>sum+num(current[r.cluster]?.four),0);
-    const simProd=simTotal>0?total/simTotal:0; const actualProd=actual.total>0?total/actual.total:0;
+    const simProd=simTotal>0?total/simTotal:0; const actualProd=actual.regular>0?total/actual.regular:0;
     const fpTarget=targetFP();
     const simFP=fpTarget>0?simProd/fpTarget*100:0; const actualFP=fpTarget>0?actualProd/fpTarget*100:0;
     // 4WH Usage is a ratio (for example 0.50), not a percentage.
@@ -11160,7 +11297,7 @@ NOL3.pages.riders = function (root) {
             <div></div><div class="fleet-overview-kpi-head">Target To Achieve A+</div><div class="fleet-overview-kpi-head">Actual Number</div><div class="fleet-overview-kpi-head">Achievement Rate</div><div></div>
           </div>
           <div class="fleet-overview-kpi-body">
-            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Allmile Productivity</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverviewFPTarget" type="number" min="1" step="0.01" value="${fpTarget}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${Math.round(actualProd).toLocaleString()}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${((Number(fpTarget)||0)>0?(actualFP/Number(fpTarget))*100:0).toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.total.toLocaleString()} deployed / ${riders.length.toLocaleString()} active</div></div>
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Allmile Productivity</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverviewFPTarget" type="number" min="1" step="0.01" value="${fpTarget}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${Math.round(actualProd).toLocaleString()}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${((Number(fpTarget)||0)>0?(actualFP/Number(fpTarget))*100:0).toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.regular.toLocaleString()} regular deployed / ${riders.length.toLocaleString()} active</div></div>
             <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">4WH Usage</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverview4WHTarget" type="number" min="0" step="0.01" value="${fourTarget.toFixed(2)}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${actual4Usage.toFixed(2)}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${inv(actual4Usage,fourTarget).toFixed(0)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">Actual 4WH ratio</div></div>
             <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Current SR</div><div class="fleet-overview-kpi-col"><span class="fleet-overview-kpi-editor-wrap"><input class="fleet-overview-kpi-editor" id="fleetOverviewSRTarget" type="number" min="0" max="100" step="0.01" value="${currentSRTargetPct}"><span>%</span></span></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value"></div><div class="fleet-overview-kpi-col fleet-overview-rate"></div><div class="fleet-overview-kpi-col fleet-overview-muted"></div></div>
           </div>

@@ -2248,6 +2248,34 @@ th{color:#667085;font-weight:650}
         display: none !important;
       }
     </style>
+<style id="rider-ux-fixes">
+.riders-clear-btn{border:1px solid #f0b7b2;background:#fff;color:#b42318;border-radius:10px;padding:10px 14px;font-weight:650;cursor:pointer}
+.riders-clear-btn:hover{background:#fff5f4}.riders-clear-btn:disabled{opacity:.5;cursor:not-allowed}
+.delivery-area-group{overflow:visible!important}.delivery-area-group-header{border-radius:12px 12px 0 0}
+.town-group-rider-menu{width:min(400px,86vw)!important;max-height:min(440px,65vh)!important;left:0!important;right:auto!important;padding:10px!important;z-index:1000!important}
+.town-group-rider-search{position:sticky;top:0;z-index:2;padding:10px!important;font-size:13px!important;background:#fff}
+.town-group-rider-option{padding:10px 8px!important;font-size:13px!important;min-height:42px}
+.town-group-rider-option input{width:18px!important;height:18px!important}
+.town-group-rider-option span{white-space:normal!important}
+.rider-bulk{display:flex;gap:6px;margin:0 0 6px}
+.rider-bulk button{flex:1;border:1px solid var(--line);background:#f8fafc;color:#344054;border-radius:7px;padding:7px;font-size:11px;font-weight:700;cursor:pointer}
+.rider-bulk button:hover{background:var(--accent-soft);color:var(--accent)}
+.town-group-rider-chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:5px}
+.rider-chip{display:inline-flex;align-items:center;gap:5px;background:var(--accent-soft);color:var(--accent);border-radius:999px;padding:2px 3px 2px 9px;font-size:10px;font-weight:800}
+.rider-chip-x{border:0;background:var(--accent);color:#fff;width:16px;height:16px;border-radius:50%;padding:0;line-height:16px;font-size:11px;cursor:pointer}
+.rider-chip-x:hover{background:#dc2626}
+.town-group-rider-chips{gap:3px!important;margin-bottom:4px!important}
+.town-group-rider-chips.open{max-height:92px;overflow-y:auto;padding-right:2px}
+.rider-chip{padding:1px 2px 1px 7px!important;gap:4px!important;max-width:100%}
+.rider-chip-name{max-width:105px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rider-chip-x{width:14px!important;height:14px!important;line-height:14px!important;font-size:10px!important;flex:0 0 14px}
+.rider-chip-more{border:1px dashed #93b4f5;background:#fff;color:var(--accent);border-radius:999px;padding:1px 8px;font-size:10px;font-weight:800;cursor:pointer}
+.rider-chip-more:hover{background:var(--accent-soft)}
+.town-group-rider-button{min-height:24px!important;padding:3px 8px!important}
+.town-group-dropzone{max-height:244px;overflow-y:auto;overscroll-behavior:contain;scrollbar-width:thin;scrollbar-color:#cbd5e1 transparent}
+.town-group-dropzone::-webkit-scrollbar{width:6px}
+.town-group-dropzone::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:6px}
+</style>
 </head>
 <body>
 <div class="app-shell">
@@ -2557,12 +2585,12 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
               INVENTORY
             </h2>
             <p class="inventory-help">
-              Upload the daily export CSV here. The dashboard automatically separates LM and Incoming statuses while preserving the existing calculations.
+              Upload one or more daily export CSVs at once. Rows are added to the existing inventory (LM and Incoming are separated automatically). Duplicate Order IDs are counted only once, and the newest record wins.
             </p>
             <label class="upload-zone" id="unifiedInventoryUploadZone">
-              <input id="unifiedInventoryFile" type="file" accept=".csv,text/csv" hidden>
+              <input id="unifiedInventoryFile" type="file" accept=".csv,text/csv" multiple hidden>
               <div class="upload-icon">♧</div>
-              <strong>Click to upload CSV file</strong>
+              <strong>Click to upload CSV file(s)</strong>
               <div class="file-summary" id="unifiedInventorySummary">No file selected</div>
             </label>
             <button class="inventory-clear-btn" id="clearUnifiedInventoryBtn" type="button" disabled onclick="window.NOL3_undoUnifiedInventory(event)">Undo Last Upload</button>
@@ -2765,7 +2793,7 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
           if (!parsed.length) continue;
           const headers = parsed[0].map(value => value.trim());
           const rows = parsed.slice(1).filter(row => row.some(value => String(value || "").trim() !== ""));
-          parsedFiles.push({ file, headers, rows, isForward: isForwardOrderFile(file) });
+          parsedFiles.push({ file, headers, rows: NOL3.filterRowsToHub(headers, rows, 'lm').rows, isForward: isForwardOrderFile(file) });
         } catch (error) {
           console.warn("NOL3: Could not parse LM file", file?.name, error);
         }
@@ -2913,12 +2941,19 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
       }
 
       // Any upload changes the active snapshot, so discard the cached volume
-      // for the selected hub/business date and recalculate from the new data.
+      // for the selected hub — always for TODAY's real date, matching where
+      // the upload itself is saved (getNOL3TodayDate), never whatever date
+      // happens to be showing in the Business Date picker. Using the
+      // picker's date here was a real bug: uploading while viewing a past
+      // date would silently wipe that past date's already-frozen volume
+      // instead of today's.
       try {
         const hubForFreeze = getSelectedHub() || "__default__";
-        const businessDateForFreeze = getBusinessDateValue();
+        const dateForFreezeClear = (typeof getNOL3TodayDate === "function")
+          ? getNOL3TodayDate()
+          : new Date().toISOString().slice(0, 10);
         const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
-        delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+        delete frozenStore[`${hubForFreeze}::${dateForFreezeClear}`];
         NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
       } catch (_) {}
 
@@ -3135,7 +3170,7 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
           }
         }
 
-        const merged = mergeLMInventoryRows(baseInventory, headers, rows);
+        const merged = mergeLMInventoryRows(baseInventory, headers, NOL3.filterRowsToHub(headers, rows, 'lm').rows);
         const baseFiles = Array.isArray(baseInventory.files) ? baseInventory.files : [];
         const allFiles = [...baseFiles, file].filter((item, index, arr) =>
           arr.findIndex(x => x.name === item.name && (x.lastModified || 0) === (item.lastModified || 0)) === index
@@ -3152,9 +3187,11 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
 
         try {
           const hubForFreeze = getSelectedHub() || "__default__";
-          const businessDateForFreeze = getBusinessDateValue();
+          const dateForFreezeClear = (typeof getNOL3TodayDate === "function")
+            ? getNOL3TodayDate()
+            : new Date().toISOString().slice(0, 10);
           const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || "{}");
-          delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+          delete frozenStore[`${hubForFreeze}::${dateForFreezeClear}`];
           NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
         } catch (_) {}
 
@@ -3307,28 +3344,34 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
 
     if (unifiedInventoryInput) {
       unifiedInventoryInput.addEventListener('click', () => { unifiedInventoryInput.value = ''; });
-      unifiedInventoryInput.addEventListener('change', async () => {
-        const file = unifiedInventoryInput.files && unifiedInventoryInput.files[0];
-        if (!file) return;
-        const summary = document.getElementById('unifiedInventorySummary');
+      const processUnifiedFile = async (file, batchInfo) => {
         const statusEl = document.getElementById('unifiedInventoryStatus');
-        if (summary) summary.textContent = file.name;
-        if (statusEl) statusEl.textContent = 'Processing inventory…';
+        if (statusEl) statusEl.textContent = `Processing ${file.name}…`;
 
         try {
           // Read the selected CSV directly. Do not depend on the separate CSV-file
           // event/parser pipeline; this prevents the upload from being reported as
           // failed when another module is not initialized yet.
-          const text = await file.text();
+          let text = await file.text();
           const parsed = parseUnifiedCSV(text);
           if (parsed.length < 2) throw new Error('CSV contains no inventory rows');
 
           const headers = parsed[0].map(v => String(v ?? '').replace(/^\uFEFF/, '').trim());
-          const newRows = parsed.slice(1).filter(row => row.some(v => String(v ?? '').trim() !== ''));
+          let newRows = parsed.slice(1).filter(row => row.some(v => String(v ?? '').trim() !== ''));
           const orderIdx = headers.findIndex(h => String(h).trim().toLowerCase() === 'order id');
           const statusIdx = headers.findIndex(h => String(h).trim().toLowerCase() === 'status');
           if (orderIdx < 0) throw new Error('Order ID column not found');
           if (statusIdx < 0) throw new Error('Status column not found');
+
+          // Only keep rows that belong to the selected hub.
+          const hubFiltered = NOL3.filterRowsToHub(headers, newRows, 'auto');
+          const hubDropped = hubFiltered.dropped;
+          const hubLabel = String((NOL3.getState && NOL3.getState().selectedHub) || 'this hub');
+          if (hubDropped > 0) {
+            if (!hubFiltered.rows.length) throw new Error(`No rows for ${hubLabel} found (Current Station / Destination Station must be ${hubLabel})`);
+            newRows = hubFiltered.rows;
+            text = NOL3.rowsToCSV(headers, newRows);
+          }
 
           // EVERY Inventory upload is incremental/stacked.
           //
@@ -3482,21 +3525,37 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
           // Incoming-only file: keep LM so Town count and Total Volume do not reset.
           // LM-only file: keep Incoming so Incoming Orders do not disappear.
           // Mixed file: use the uploaded partitions as the complete replacement.
-          const lmRows = uniqueByOrderId(
-            hasLMUpload ? uploaded.lm : previousLMCanonical
-          );
-          const incomingRows = uniqueByOrderId(
-            hasIncomingUpload ? uploaded.incoming : previousIncomingCanonical
-          );
+          const previousOther = (Array.isArray(previousDataset.rows) ? previousDataset.rows : [])
+            .map(row => toCanonical(row, previousHeaders))
+            .filter(row => { const st = statusIndex >= 0 ? String(row[statusIndex] ?? '').trim() : ''; return !lmStatuses.has(st) && !incomingStatuses.has(st); });
 
-          // Keep unknown statuses from the new upload, but never let them wipe
-          // either recognized operational partition.
-          const otherRows = uploaded.other;
+          // STACK: previous inventory + this upload. One record per Order ID;
+          // the record with the newest status timestamp wins (ties -> this upload).
+          const combined = new Map();
+          const putRow = (row, part) => {
+            const id = String(row?.[orderIndex] ?? '').trim();
+            if (!id) return;
+            const cur = combined.get(id);
+            if (!cur || getLMRowLatestTimestamp(row, canonicalHeaders) >= getLMRowLatestTimestamp(cur.row, canonicalHeaders)) combined.set(id, { row, part });
+          };
+          previousLMCanonical.forEach(r => putRow(r, 'lm'));
+          previousIncomingCanonical.forEach(r => putRow(r, 'incoming'));
+          previousOther.forEach(r => putRow(r, 'other'));
+          const prevIds = new Set(combined.keys());
+          uploaded.lm.forEach(r => putRow(r, 'lm'));
+          uploaded.incoming.forEach(r => putRow(r, 'incoming'));
+          uploaded.other.forEach(r => putRow(r, 'other'));
+
+          const lmRows = [], incomingRows = [], otherRows = [];
+          combined.forEach(({ row, part }) => { (part === 'lm' ? lmRows : part === 'incoming' ? incomingRows : otherRows).push(row); });
           const otherCount = otherRows.length;
           const mergedRows = [...lmRows, ...incomingRows, ...otherRows];
 
-          const addedCount = newRows.length;
-          const updatedCount = 0;
+          const uploadIds = new Set(newRows.map(r => String(r?.[orderIndex] ?? '').trim()).filter(Boolean));
+          const existingCount = [...uploadIds].filter(id => prevIds.has(id)).length;
+          const addedCount = uploadIds.size - existingCount;
+          const updatedCount = existingCount + (newRows.length - uploadIds.size); // duplicates merged, not double-counted
+          if (batchInfo) { batchInfo.added += addedCount; batchInfo.dups += updatedCount; batchInfo.ignored += hubDropped; }
 
           // Keep file metadata for the active unified snapshot. The metadata is
           // separate from the actual LM/Incoming partitions so preserving one
@@ -3611,14 +3670,16 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
           // Any inventory update invalidates the current cached business-day metric.
           try {
             const hubForFreeze = getSelectedHub() || '__default__';
-            const businessDateForFreeze = getBusinessDateValue();
+            const dateForFreezeClear = (typeof getNOL3TodayDate === 'function')
+              ? getNOL3TodayDate()
+              : new Date().toISOString().slice(0, 10);
             const frozenStore = JSON.parse(NOL3Storage.get(FROZEN_TODAY_VOLUME_KEY) || '{}');
-            delete frozenStore[`${hubForFreeze}::${businessDateForFreeze}`];
+            delete frozenStore[`${hubForFreeze}::${dateForFreezeClear}`];
             NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(frozenStore));
           } catch (_) {}
 
           if (statusEl) {
-            statusEl.textContent = `${mergedRows.length.toLocaleString()} total orders · ${lmRows.length.toLocaleString()} LM · ${incomingRows.length.toLocaleString()} Incoming · ${addedCount.toLocaleString()} added · ${updatedCount.toLocaleString()} updated${otherCount ? ` · ${otherCount.toLocaleString()} other status` : ''}`;
+            statusEl.textContent = `${mergedRows.length.toLocaleString()} total orders · ${lmRows.length.toLocaleString()} LM · ${incomingRows.length.toLocaleString()} Incoming · ${addedCount.toLocaleString()} new · ${updatedCount.toLocaleString()} duplicates merged${otherCount ? ` · ${otherCount.toLocaleString()} other status` : ''}${hubDropped ? ` · ${hubDropped.toLocaleString()} rows ignored (not ${hubLabel})` : ''}`;
           }
           if (typeof updateLMFilterStatus === 'function') updateLMFilterStatus();
           try { if (typeof NOL3.updateInventoryUploadSummaries === 'function') await NOL3.updateInventoryUploadSummaries(); } catch (e) { console.warn('NOL3: summary refresh failed after upload', e); }
@@ -3632,6 +3693,39 @@ const NOL3_FIXED_HUB_NAME = "Badoc Hub";
         } catch (error) {
           console.error('NOL3: Could not process unified inventory.', error);
           if (statusEl) statusEl.textContent = `Could not process file: ${error?.message || 'unknown error'}`;
+          if (batchInfo) batchInfo.errors.push(`${file.name}: ${error?.message || 'unknown error'}`);
+        }
+      };
+
+      unifiedInventoryInput.addEventListener('change', async () => {
+        // Oldest file first so the newest file's records win on duplicates.
+        const files = Array.from(unifiedInventoryInput.files || []).sort((a, b) => (a.lastModified || 0) - (b.lastModified || 0));
+        if (!files.length) return;
+        const summary = document.getElementById('unifiedInventorySummary');
+        const statusEl = document.getElementById('unifiedInventoryStatus');
+        if (summary) summary.textContent = files.length === 1 ? files[0].name : `${files.length} files selected`;
+        const batchInfo = { errors: [], added: 0, dups: 0, ignored: 0 };
+        const undoBefore = NOL3._inventoryUndoMemory;
+        let firstUndo = null;
+        for (const file of files) {
+          await processUnifiedFile(file, batchInfo);
+          // Undo must revert the WHOLE batch: keep the state from before the first successful file.
+          if (!firstUndo && NOL3._inventoryUndoMemory && NOL3._inventoryUndoMemory !== undoBefore) firstUndo = { ...NOL3._inventoryUndoMemory };
+        }
+        if (files.length > 1) {
+          if (firstUndo) {
+            NOL3._inventoryUndoMemory = firstUndo;
+            try { await NOL3._storagePut({ type: 'unifiedInventoryUndo', ...firstUndo }); } catch (_) {}
+            const undoBtn = document.getElementById('clearUnifiedInventoryBtn');
+            if (undoBtn) undoBtn.disabled = false;
+          }
+          if (statusEl) {
+            const lmN = NOL3.lmInventory?.rows?.length || 0, inN = NOL3.incomingInventory?.rows?.length || 0;
+            const ok = files.length - batchInfo.errors.length;
+            statusEl.textContent = `${ok}/${files.length} files added · ${(lmN + inN).toLocaleString()} total orders · ${lmN.toLocaleString()} LM · ${inN.toLocaleString()} Incoming · ${batchInfo.added.toLocaleString()} new · ${batchInfo.dups.toLocaleString()} duplicates merged`
+              + (batchInfo.ignored ? ` · ${batchInfo.ignored.toLocaleString()} rows ignored (other hubs)` : '')
+              + (batchInfo.errors.length ? ` · Errors: ${batchInfo.errors.join('; ')}` : '');
+          }
         }
       });
     }
@@ -4348,13 +4442,13 @@ NOL3.pages.planning = function (root) {
     const saveFrozenTodayVolumeStore = (store) => {
       try { NOL3Storage.set(FROZEN_TODAY_VOLUME_KEY, JSON.stringify(store || {})); } catch (_) {}
     };
-    const getFrozenTodayVolume = (hub) => {
+    const getFrozenTodayVolume = (hub, businessDate) => {
       const store = loadFrozenTodayVolumeStore();
-      return store[String(hub || "__default__")] || null;
+      return store[`${String(hub || "__default__")}::${businessDate}`] || null;
     };
     const setFrozenTodayVolume = (hub, businessDate, value) => {
       const store = loadFrozenTodayVolumeStore();
-      store[String(hub || "__default__")] = { businessDate, value: Number(value) || 0, frozenAt: new Date().toISOString() };
+      store[`${String(hub || "__default__")}::${businessDate}`] = { businessDate, value: Number(value) || 0, frozenAt: new Date().toISOString() };
       saveFrozenTodayVolumeStore(store);
     };
 
@@ -4490,8 +4584,30 @@ NOL3.pages.planning = function (root) {
       });
 
       const liveTodayVolume = result.dueIds.size;
-      result.todayVolume = liveTodayVolume;
-      result.todayVolumeFrozen = false;
+      // Freeze at COT: once the viewed business date's own LH COT is reached,
+      // capture the live volume once and lock it in for that specific date —
+      // a later LM upload (which moves NOL3.lmInventory forward to a newer
+      // date) must not change what a past date shows. Keyed by hub AND
+      // business date together (not hub alone) so freezing one date can
+      // never overwrite another date's already-locked value.
+      const hubForFreeze = getSelectedHub() || "__default__";
+      const frozen = getFrozenTodayVolume(hubForFreeze, businessDate);
+      const realTodayForFreeze = (typeof getNOL3TodayDate === "function")
+        ? getNOL3TodayDate()
+        : formatBusinessDateInput(new Date());
+      const isViewingRealTodayForFreeze = businessDate === realTodayForFreeze;
+      let frozenForThisDate = false;
+      let displayVolume = liveTodayVolume;
+      if (frozen && frozen.businessDate === businessDate) {
+        displayVolume = Number(frozen.value) || 0;
+        frozenForThisDate = true;
+      } else if (isViewingRealTodayForFreeze && new Date().getTime() >= cot.getTime()) {
+        displayVolume = liveTodayVolume;
+        setFrozenTodayVolume(hubForFreeze, businessDate, displayVolume);
+        frozenForThisDate = true;
+      }
+      result.todayVolume = displayVolume;
+      result.todayVolumeFrozen = frozenForThisDate;
       result.liveTodayVolume = liveTodayVolume;
       result.totalDispatched = result.dispatchedIds.size;
       result.totalBacklogs = Math.max(0, result.todayVolume - result.totalDispatched);
@@ -5555,62 +5671,15 @@ NOL3.pages.planning = function (root) {
     };
 
     const refreshDeliveryAreaAfterTownMove = (town, targetAreaId = null, targetGroupId = null) => {
-      // Update only the affected town chips/counts instead of rebuilding every Delivery Area.
-      document.querySelectorAll('.town-chip').forEach(chip => {
-        if (chip.dataset.town === town) chip.remove();
-      });
-
-      document.querySelectorAll('.town-group-dropzone').forEach(zone => {
-        const groupId = zone.dataset.groupId;
-        const areaId = zone.dataset.areaId;
-        const area = NOL3.deliveryAreas.find(item => item.id === areaId);
-        const group = area && ensureAreaGroups(area).find(item => item.id === groupId);
-        if (!group) return;
-
-        const countEl = zone.closest('.town-group')?.querySelector('.town-group-count');
-        if (countEl) countEl.textContent = `${group.towns.length.toLocaleString()} town${group.towns.length === 1 ? '' : 's'}`;
-
-        if (!group.towns.length) {
-          zone.innerHTML = '<div class="delivery-area-empty">Drag towns here</div>';
-        } else if (!zone.querySelector('.town-chip')) {
-          zone.innerHTML = '';
-        }
-      });
-
-      if (targetAreaId && targetGroupId) {
-        const area = NOL3.deliveryAreas.find(item => item.id === targetAreaId);
-        const group = area && ensureAreaGroups(area).find(item => item.id === targetGroupId);
-        const zone = document.querySelector(`.town-group-dropzone[data-area-id="${CSS.escape(targetAreaId)}"][data-group-id="${CSS.escape(targetGroupId)}"]`);
-        if (group && zone) {
-          const empty = zone.querySelector('.delivery-area-empty');
-          if (empty) empty.remove();
-          const lm = NOL3.lmInventory;
-          let townCount = 0;
-          if (lm && Array.isArray(lm.filteredRows) && Array.isArray(lm.headers)) {
-            const ti = findTownColumn(lm.headers);
-            if (ti >= 0) townCount = lm.filteredRows.reduce((n, row) => n + (parseTownValue(row[ti]) === town ? 1 : 0), 0);
-          }
-          const chip = document.createElement('div');
-          chip.className = 'town-chip';
-          chip.draggable = true;
-          chip.dataset.town = town;
-          chip.title = town;
-          chip.innerHTML = `<span class="town-chip-name">${NOL3.escapeHTML(town)}</span><span class="town-chip-count">${townCount.toLocaleString()}</span>`;
-          zone.appendChild(chip);
-          bindTownDragging();
-        }
-      }
-
-      // Refresh only the small area summary counts.
-      document.querySelectorAll('.delivery-area-group').forEach(section => {
-        const areaId = section.dataset.areaId;
-        const area = NOL3.deliveryAreas.find(item => item.id === areaId);
-        if (!area) return;
-        const groups = ensureAreaGroups(area);
-        const total = groups.reduce((sum, group) => sum + group.towns.length, 0);
-        const countEl = section.querySelector('.delivery-area-group-count');
-        if (countEl) countEl.textContent = `${total.toLocaleString()} town${total === 1 ? '' : 's'} · ${groups.length} group${groups.length === 1 ? '' : 's'}`;
-      });
+      // Full re-render so group totals, FP, SR, area counts and the town chip's
+      // status badges are all recalculated immediately (no need to leave and
+      // re-open the page). Keep the scroll position so the view does not jump.
+      const y = window.scrollY, x = window.scrollX;
+      const zoneScroll = new Map();
+      document.querySelectorAll('.town-group-dropzone').forEach(z => zoneScroll.set(z.dataset.groupId, z.scrollTop));
+      renderDeliveryAreas();
+      document.querySelectorAll('.town-group-dropzone').forEach(z => { const t = zoneScroll.get(z.dataset.groupId); if (t) z.scrollTop = t; });
+      window.scrollTo(x, y);
     };
 
     const deleteTownGroup = (areaId, groupId) => {
@@ -6312,6 +6381,30 @@ NOL3.pages.planning = function (root) {
         } catch (_) { return null; }
       };
 
+      // Single source of truth: the same number a chip displays is what group/area totals add up.
+      const _spCache = new Map(), _ccCache = new Map();
+      const _splitFor = town => {
+        if (_spCache.has(town)) return _spCache.get(town);
+        let s = null;
+        if (!parseOperationalTownKey(town)) {
+          const x = getZoneOperationalSplits(town);
+          if (x && [...x.values()].some(item => item.count > 0)) s = x;
+        }
+        _spCache.set(town, s); return s;
+      };
+      const chipCount = town => {
+        if (_ccCache.has(town)) return _ccCache.get(town);
+        const s = _splitFor(town);
+        const v = s ? [...s.values()].reduce((n, item) => n + item.count, 0) : Number(townCounts.get(town) || 0);
+        _ccCache.set(town, v); return v;
+      };
+      const chipStatus = town => {
+        const z = {received:0,delivering:0,delivered:0,hold:0};
+        const s = _splitFor(town);
+        if (!s) return townStatusMetrics.get(town) || z;
+        s.forEach(item => { z.received += item.received; z.delivering += item.delivering; z.delivered += item.delivered; z.hold += item.hold; });
+        return z;
+      };
       NOL3.deliveryAreas.forEach(area => {
         const groups = ensureAreaGroups(area);
         const totalTowns = groups.reduce((sum, group) => sum + group.towns.length, 0);
@@ -6319,7 +6412,7 @@ NOL3.pages.planning = function (root) {
         // This uses the same townCounts map that drives the individual town/group totals,
         // so the Delivery Area total follows the existing Planning calculations.
         const totalAreaVolume = groups.reduce((sum, group) =>
-          sum + group.towns.reduce((townSum, town) => townSum + Number(townCounts.get(town) || 0), 0), 0);
+          sum + group.towns.reduce((townSum, town) => townSum + chipCount(town), 0), 0);
         const section = document.createElement('div');
         section.className = 'delivery-area-group';
         section.dataset.areaId = area.id;
@@ -6341,8 +6434,8 @@ NOL3.pages.planning = function (root) {
                   </div>
                   <div class="town-group-metrics">
                     <span class="town-group-fp" title="Fleet Productivity">FP —</span>
-  <span class="town-group-sr" data-area-id="${area.id}" data-group-id="${group.id}" title="Group Success Rate">SR ${formatSuccessRate(group.towns.reduce((acc, town) => { const m = townStatusMetrics.get(town) || {received:0,delivering:0,delivered:0,hold:0}; acc.received += m.received; acc.delivering += m.delivering; acc.delivered += m.delivered; acc.hold += m.hold; return acc; }, {received:0,delivering:0,delivered:0,hold:0}))}%</span>
-                    <span class="town-group-total" data-area-id="${area.id}" data-group-id="${group.id}">${group.towns.reduce((sum, town) => sum + (townCounts.get(town) || 0), 0).toLocaleString()}</span>
+  <span class="town-group-sr" data-area-id="${area.id}" data-group-id="${group.id}" title="Group Success Rate">SR ${formatSuccessRate(group.towns.reduce((acc, town) => { const m = chipStatus(town); acc.received += m.received; acc.delivering += m.delivering; acc.delivered += m.delivered; acc.hold += m.hold; return acc; }, {received:0,delivering:0,delivered:0,hold:0}))}%</span>
+                    <span class="town-group-total" data-area-id="${area.id}" data-group-id="${group.id}" title="${group.towns.map(t => chipCount(t)).join(' + ') || 0}">${group.towns.reduce((sum, town) => sum + chipCount(town), 0).toLocaleString()}</span>
                     <button class="town-group-delete" type="button" data-area-id="${area.id}" data-group-id="${group.id}" title="Delete town group" aria-label="Delete ${NOL3.escapeHTML(group.title)}">×</button>
                   </div>
                 </div>
@@ -6488,6 +6581,17 @@ NOL3.pages.planning = function (root) {
       };
       normalizeRiderAssignments();
 
+      const getRiderOwnerLabel = (riderId, areaId, groupId) => {
+        for (const ai of NOL3.deliveryAreas) {
+          const gs = ensureAreaGroups(ai);
+          for (let gi = 0; gi < gs.length; gi++) {
+            if (ai.id === areaId && gs[gi].id === groupId) continue;
+            if ((gs[gi].assignedRiders || []).map(String).includes(String(riderId))) return `${ai.title} · Group ${gi + 1}`;
+          }
+        }
+        return '';
+      };
+
       const getAssignedElsewhere = (areaId, groupId) => {
         const assigned = new Set();
         NOL3.deliveryAreas.forEach(areaItem => {
@@ -6503,20 +6607,35 @@ NOL3.pages.planning = function (root) {
         const ids = Array.isArray(group.assignedRiders) ? group.assignedRiders.map(String) : [];
         const assigned = ids.map(id => riderById.get(id)).filter(Boolean)
           .sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
-        const groupTotal = group.towns.reduce((sum, town) => sum + (townCounts.get(town) || 0), 0);
+        const groupTotal = group.towns.reduce((sum, town) => sum + chipCount(town), 0);
         const groupStatus = group.towns.reduce((acc, town) => {
-          const m = townStatusMetrics.get(town) || {received:0,delivering:0,delivered:0,hold:0};
+          const m = chipStatus(town);
           acc.received += m.received; acc.delivering += m.delivering; acc.delivered += m.delivered; acc.hold += m.hold;
           return acc;
         }, {received:0,delivering:0,delivered:0,hold:0});
-        if (!assigned.length) {
-          button.textContent = 'Assign Riders';
-          button.title = 'Assign Riders';
-        } else {
-          const lines = assigned.map(rider => `${rider.name || rider.id}`);
-          button.innerHTML = lines.map(line => `<div>${NOL3.escapeHTML(line)}</div>`).join('');
-          button.title = lines.join('\n');
-        }
+        button.textContent = assigned.length ? `Assign Riders (${assigned.length})` : 'Assign Riders';
+        button.title = assigned.map(r => r.name || r.id).join('\n') || 'Assign Riders';
+        const pk = button.closest('.town-group-rider-picker');
+        let chipsEl = pk.querySelector('.town-group-rider-chips');
+        if (!chipsEl) { chipsEl = document.createElement('div'); chipsEl.className = 'town-group-rider-chips'; pk.insertBefore(chipsEl, button); }
+        NOL3._riderChipsOpen = NOL3._riderChipsOpen || new Set();
+        const chipsOpen = NOL3._riderChipsOpen.has(group.id);
+        const CHIP_LIMIT = 2;
+        const shownRiders = chipsOpen ? assigned : assigned.slice(0, CHIP_LIMIT);
+        chipsEl.classList.toggle('open', chipsOpen);
+        chipsEl.innerHTML = shownRiders.map(r => `<span class="rider-chip" title="${NOL3.escapeHTML(r.name || r.id)}"><span class="rider-chip-name">${NOL3.escapeHTML(r.name || r.id)}</span><button type="button" class="rider-chip-x" data-rider-id="${NOL3.escapeHTML(r.id)}" aria-label="Unassign ${NOL3.escapeHTML(r.name || r.id)}" title="Unassign">×</button></span>`).join('')
+          + (assigned.length > CHIP_LIMIT ? `<button type="button" class="rider-chip-more">${chipsOpen ? 'Show less' : '+' + (assigned.length - CHIP_LIMIT) + ' more'}</button>` : '');
+        chipsEl.querySelector('.rider-chip-more')?.addEventListener('click', ev => {
+          ev.preventDefault(); ev.stopPropagation();
+          if (chipsOpen) NOL3._riderChipsOpen.delete(group.id); else NOL3._riderChipsOpen.add(group.id);
+          updateRiderButton(button, group);
+        });
+        chipsEl.querySelectorAll('.rider-chip-x').forEach(x => x.addEventListener('click', ev => {
+          ev.preventDefault(); ev.stopPropagation();
+          group.assignedRiders = (group.assignedRiders || []).map(String).filter(id => id !== String(x.dataset.riderId));
+          savePlanningLayout();
+          renderDeliveryAreas();
+        }));
         const picker = button.closest('.town-group-rider-picker');
         const totalEl = picker?.parentElement?.querySelector('.town-group-total');
         if (totalEl) totalEl.textContent = groupTotal.toLocaleString();
@@ -6544,17 +6663,16 @@ NOL3.pages.planning = function (root) {
 
         updateRiderButton(button, group);
         const assignedToOtherGroups = getAssignedElsewhere(areaId, groupId);
-        const availableRiders = activeRiders.filter(rider => {
-          const riderId = String(rider.id);
-          return group.assignedRiders.includes(riderId) || !assignedToOtherGroups.has(riderId);
-        }).sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
+        const availableRiders = activeRiders.slice().sort((a, b) => String(a.name || a.id).localeCompare(String(b.name || b.id)));
 
         menu.innerHTML = `
           <input class="town-group-rider-search" type="search" placeholder="Search rider name..." value="${NOL3.escapeHTML(searchValue)}" autocomplete="off">
+          <div class="rider-bulk"><button type="button" class="rider-bulk-all">Select all visible</button><button type="button" class="rider-bulk-none">Clear all</button></div>
           <div class="town-group-rider-options">
             ${availableRiders.length ? availableRiders.map(rider => {
               const checked = group.assignedRiders.includes(String(rider.id));
-              const label = `${rider.name || rider.id} — ${rider.vehicleType || 'Vehicle'}`;
+              const ownerLbl = checked ? '' : getRiderOwnerLabel(rider.id, areaId, groupId);
+              const label = `${rider.name || rider.id} — ${rider.vehicleType || 'Vehicle'}${ownerLbl ? ' · in ' + ownerLbl + ' (moves here)' : ''}`;
               return `<label class="town-group-rider-option"><input type="checkbox" value="${NOL3.escapeHTML(rider.id)}" ${checked ? 'checked' : ''}><span>${NOL3.escapeHTML(label)}</span></label>`;
             }).join('') : '<div class="town-group-rider-empty">No active riders available</div>'}
           </div>
@@ -6610,6 +6728,23 @@ NOL3.pages.planning = function (root) {
               if (newSearch) newSearch.setSelectionRange(newSearch.value.length, newSearch.value.length);
             }
           });
+        });
+        const afterBulk = () => {
+          savePlanningLayout();
+          groupsRoot.querySelectorAll('.town-group-rider-picker').forEach(op => { if (op === picker) return; renderRiderPicker(op, ''); op.classList.remove('open'); });
+          renderRiderPicker(picker, String(search?.value || ''));
+        };
+        menu.querySelector('.rider-bulk-all')?.addEventListener('click', ev => {
+          ev.preventDefault(); ev.stopPropagation();
+          const ids = [...menu.querySelectorAll('.town-group-rider-option')].filter(o => o.style.display !== 'none').map(o => String(o.querySelector('input').value));
+          NOL3.deliveryAreas.forEach(ai => ensureAreaGroups(ai).forEach(gi => { if (ai.id === areaId && gi.id === groupId) return; gi.assignedRiders = (gi.assignedRiders || []).map(String).filter(id => !ids.includes(id)); }));
+          group.assignedRiders = [...new Set([...group.assignedRiders.map(String), ...ids])];
+          afterBulk();
+        });
+        menu.querySelector('.rider-bulk-none')?.addEventListener('click', ev => {
+          ev.preventDefault(); ev.stopPropagation();
+          group.assignedRiders = [];
+          afterBulk();
         });
         filterOptions();
       };
@@ -7934,10 +8069,10 @@ NOL3.pages.riders = function (root) {
             <div class="riders-file-name" id="ridersFileName">No rider file uploaded</div>
           </div>
 
-          <label class="riders-upload-btn">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap"><label class="riders-upload-btn">
             Upload Rider CSV
             <input id="ridersFile" type="file" accept=".csv,text/csv" hidden>
-          </label>
+          </label><button id="clearRidersBtn" class="riders-clear-btn" type="button">Clear Rider Data</button></div>
         </div>
 
         <div class="riders-controls">
@@ -8024,6 +8159,15 @@ NOL3.pages.riders = function (root) {
 
     hideSuspendedInput.addEventListener("change", () => {
       if (loadedRiderResult) renderRiderData(loadedRiderResult);
+    });
+
+    document.getElementById("clearRidersBtn")?.addEventListener("click", async () => {
+      const ok = window.confirm("CLEAR RIDER DATA?\n\nThis removes the uploaded rider roster and all rider assignments for this hub, including the cloud copy.\n\nTowns, zone settings, and inventory are NOT changed.\n\nContinue?");
+      if (!ok) return;
+      const btn = document.getElementById("clearRidersBtn");
+      if (btn) { btn.disabled = true; btn.textContent = "CLEARING..."; }
+      try { await NOL3.clearRiderData(); }
+      catch (error) { console.error("NOL3: Could not clear rider data.", error); alert("Could not clear rider data: " + (error?.message || "unknown error")); if (btn) { btn.disabled = false; btn.textContent = "Clear Rider Data"; } }
     });
 
     function renderRiderData(result) {
@@ -9153,7 +9297,13 @@ NOL3.pages.riders = function (root) {
     const value = store[hub];
     return value && typeof value === "object" ? value : null;
   };
-  window.NOL3RiderHubStore = { save: saveRiderDataForHub, load: loadRiderDataForHub };
+  window.NOL3RiderHubStore = {
+    save: saveRiderDataForHub,
+    load: loadRiderDataForHub,
+    clear: (hub = getCurrentHubName()) => {
+      try { const s = getRiderHubStore(); delete s[hub]; NOL3Storage.set(RIDER_HUB_STORE_KEY, JSON.stringify(s)); } catch (_) {}
+    }
+  };
 
   NOL3.saveUploadedData = async function (type, files, dataset = null) {
     try {
@@ -9471,6 +9621,8 @@ NOL3.pages.riders = function (root) {
       const parsed = parseFlexibleCSV(result.rawText);
       result.headers = parsed.length ? parsed[0].map(value => String(value).trim()) : [];
       result.rows = parsed.length ? parsed.slice(1).filter(row => row.some(value => String(value || "").trim() !== "")) : [];
+      { const hf = NOL3.filterRowsToHub(result.headers, result.rows, 'incoming');
+        if (hf.dropped > 0) { result.rows = hf.rows; result.rawText = NOL3.rowsToCSV(result.headers, hf.rows); } }
       result.rowCount = result.rows.length;
       NOL3.incomingInventory = result;
       NOL3.saveUploadedData("incoming", [file], result);
@@ -9958,7 +10110,16 @@ NOL3.pages.riders = function (root) {
       };
     },
     async applyRemote(data) {
-      if (!data || !data.riderData) return;
+      if (!data) return;
+      if (data.clearedByUser === true && !data.riderData) {
+        NOL3.riderData = null;
+        try { window.NOL3RiderHubStore?.clear?.((NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME); } catch (_) {}
+        try { window.NOL3FileStore?.remove("riders"); } catch (_) {}
+        window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "cloud" } }));
+        if (NOL3.state?.currentPage === "riders" && typeof NOL3.renderPage === "function") NOL3.renderPage("riders");
+        return;
+      }
+      if (!data.riderData) return;
       NOL3.riderData = data.riderData;
       window.NOL3RiderHubStore?.save?.(data.riderData, (NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME);
       window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "cloud" } }));
@@ -10039,11 +10200,9 @@ NOL3.pages.riders = function (root) {
           rowCount: Array.isArray(lm.rows) ? lm.rows.length : 0,
           rawText: typeof lm.rawText === "string" ? lm.rawText : ""
         };
-        if (typeof filterLMForHub === "function") {
-          filterLMForHub(NOL3.lmInventory);
-          // Prefer the cloud-derived filtered snapshot when it is present.
-          if (Array.isArray(lm.filteredRows)) NOL3.lmInventory.filteredRows = lm.filteredRows;
-        }
+        if (typeof filterLMForHub === "function") filterLMForHub(NOL3.lmInventory);
+        // Older cloud rows carry filteredRows; new ones don't, so rebuild it.
+        NOL3.lmInventory.filteredRows = Array.isArray(lm.filteredRows) ? lm.filteredRows : deriveFilteredRows(NOL3.lmInventory);
       }
 
       if (data.incomingInventory) {
@@ -10106,7 +10265,7 @@ NOL3.pages.riders = function (root) {
       el.style.cssText = "position:fixed;right:16px;bottom:16px;z-index:99999;padding:8px 12px;border-radius:999px;background:#111827;color:#fff;font:600 12px/1.2 Arial,sans-serif;box-shadow:0 4px 14px rgba(0,0,0,.18);opacity:.92;pointer-events:none";
       document.body.appendChild(el);
     }
-    el.textContent = `CLOUD • ${text}`;
+    el.textContent = `CLOUD • ${text} • ${egressLabel()}`;
     el.style.opacity = good === null ? ".92" : good ? "1" : ".78";
   };
 
@@ -10132,6 +10291,7 @@ NOL3.pages.riders = function (root) {
       }
     });
     const text = await response.text();
+    trackEgress(text.length);
     if (!response.ok) throw new Error(`${response.status}: ${text || response.statusText}`);
     return text ? JSON.parse(text) : null;
   };
@@ -10229,9 +10389,135 @@ NOL3.pages.riders = function (root) {
     try { return JSON.stringify(value); } catch (_) { return String(Date.now()); }
   }
 
+  // ===== EGRESS GUARD =====
+  // 1) Polls ask Supabase only for updated_at (bytes); the big `data` column
+  //    is downloaded only when updated_at actually changed.
+  // 2) One tiny request covers all three channels.
+  // 3) No polling while the tab is hidden; slower when nobody is touching it.
+  // 4) A device never re-downloads a snapshot it just pushed itself.
+  const POLL_ACTIVE_MS = 60000;   // tab visible and recently used
+  const POLL_IDLE_MS = 120000;    // tab visible but untouched for 5+ min
+  const IDLE_AFTER_MS = 300000;
+  let lastActivityAt = Date.now();
+  ["pointerdown", "keydown", "touchstart"].forEach(ev =>
+    window.addEventListener(ev, () => { lastActivityAt = Date.now(); }, { passive: true, capture: true }));
+
+  const EGRESS_KEY = `NOL3_CLOUD_EGRESS_${HUB_CODE}`;
+  function readEgress() {
+    const day = new Date().toISOString().slice(0, 10);
+    try {
+      const raw = JSON.parse(localStorage.getItem(EGRESS_KEY) || "{}");
+      return raw.day === day ? raw : { day, bytes: 0, requests: 0 };
+    } catch (_) { return { day, bytes: 0, requests: 0 }; }
+  }
+  function trackEgress(chars) {
+    try {
+      const u = readEgress();
+      u.bytes += chars; u.requests += 1;
+      localStorage.setItem(EGRESS_KEY, JSON.stringify(u));
+    } catch (_) {}
+  }
+  function egressLabel() {
+    const u = readEgress();
+    return u.bytes ? `↓ ${(u.bytes / 1048576).toFixed(u.bytes < 10485760 ? 2 : 1)} MB today` : "↓ 0 MB today";
+  }
+
+  let stampsCache = { at: 0, promise: null };
+  function invalidateStamps() { stampsCache = { at: 0, promise: null }; }
+  function getRemoteStamps(force) {
+    const now = Date.now();
+    if (!force && stampsCache.promise && now - stampsCache.at < 4000) return stampsCache.promise;
+    const p = api(`hub_data?hub_id=eq.${HUB_ID}&select=data_type,updated_at`).then(rows => {
+      const map = {};
+      (Array.isArray(rows) ? rows : []).forEach(r => { map[r.data_type] = Date.parse(r.updated_at) || 0; });
+      return map;
+    });
+    stampsCache = { at: now, promise: p };
+    p.catch(() => { if (stampsCache.promise === p) invalidateStamps(); });
+    return p;
+  }
+
+  async function pollCycle() {
+    if (document.hidden) return;
+    await syncSettingsAndRoster();
+    await syncFiles();
+  }
+  function startAdaptivePolling() {
+    const loop = () => {
+      const idle = Date.now() - lastActivityAt > IDLE_AFTER_MS;
+      setTimeout(async () => {
+        try { await pollCycle(); } catch (_) {}
+        loop();
+      }, idle ? POLL_IDLE_MS : POLL_ACTIVE_MS);
+    };
+    loop();
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) { lastActivityAt = Date.now(); pollCycle().catch(() => {}); }
+    });
+  }
+  // ===== /EGRESS GUARD =====
+
+  // ===== PAYLOAD SLIM =====
+  // The files snapshot used to carry the same rows 3x (rows + rawText +
+  // filteredRows). Receivers never read rawText after a cloud restore and
+  // rebuild filteredRows themselves, so neither is uploaded any more. What is
+  // left is gzip-compressed (base64 inside the existing jsonb column).
+  // Old uncompressed rows are still read fine.
+  function slimFilesSnapshot(s) {
+    if (!s || typeof s !== "object") return s;
+    const out = { ...s };
+    for (const k of ["lmInventory", "incomingInventory", "lineHaulInventory"]) {
+      const v = out[k];
+      if (!v || typeof v !== "object") continue;
+      const c = { ...v };
+      delete c.filteredRows;
+      c.rawText = "";
+      if (Array.isArray(c.files)) c.files = c.files.map(f => (f && typeof f === "object") ? { name: f.name, lastModified: f.lastModified || 0 } : f);
+      out[k] = c;
+    }
+    return out;
+  }
+
+  function deriveFilteredRows(inv) {
+    const hub = String((NOL3.getState && NOL3.getState().selectedHub) || HUB_NAME).trim().toLowerCase();
+    const headers = (inv.headers || []).map(h => String(h || "").trim().toLowerCase());
+    const ci = headers.indexOf("current station");
+    if (ci < 0) return [];
+    return (inv.rows || []).filter(r => String(r?.[ci] ?? "").trim().toLowerCase() === hub);
+  }
+
+  async function packSnapshot(obj) {
+    const json = JSON.stringify(obj);
+    const stream = new Blob([json]).stream().pipeThrough(new CompressionStream("gzip"));
+    const buf = new Uint8Array(await new Response(stream).arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < buf.length; i += 0x8000) bin += String.fromCharCode.apply(null, buf.subarray(i, i + 0x8000));
+    return { z: 1, clientUpdatedAt: obj.clientUpdatedAt || 0, clearedByUser: obj.clearedByUser === true, gz: btoa(bin) };
+  }
+
+  async function unpackSnapshot(data) {
+    if (!data || data.z !== 1 || typeof data.gz !== "string") return data;   // legacy plain row
+    const bin = atob(data.gz);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    return JSON.parse(await new Response(stream).text());
+  }
+
+  async function encodeForUpload(channel, data) {
+    if (channel === filesChannel) data = slimFilesSnapshot(data);
+    if (channel !== settingsChannel && typeof CompressionStream === "function") {
+      try { return await packSnapshot(data); } catch (e) { console.warn("NOL3 cloud: compression failed, sending plain", e); }
+    }
+    return data;
+  }
+  // ===== /PAYLOAD SLIM =====
+
   async function readRemoteFor(channel) {
     const rows = await api(`hub_data?hub_id=eq.${HUB_ID}&data_type=eq.${encodeURIComponent(channel.dataType)}&select=data,updated_at&limit=1`);
-    return Array.isArray(rows) && rows.length ? rows[0] : null;
+    const row = Array.isArray(rows) && rows.length ? rows[0] : null;
+    if (row && row.data) row.data = await unpackSnapshot(row.data);
+    return row;
   }
 
   // Postgres/Supabase's jsonb columns reject the \u0000 (NUL) escape sequence
@@ -10255,7 +10541,7 @@ NOL3.pages.riders = function (root) {
     const payload = {
       hub_id: HUB_ID,
       data_type: channel.dataType,
-      data: stripNulCharacters(snapshot),
+      data: await encodeForUpload(channel, stripNulCharacters(snapshot)),
       updated_at: new Date().toISOString()
     };
     await api(`hub_data?on_conflict=hub_id,data_type`, {
@@ -10263,6 +10549,11 @@ NOL3.pages.riders = function (root) {
       headers: { Prefer: "resolution=merge-duplicates,return=minimal" },
       body: JSON.stringify(payload)
     });
+    try {
+      invalidateStamps();
+      const stamps = await getRemoteStamps(true);
+      channel.lastStamp = stamps[channel.dataType] || 0;
+    } catch (_) {}
   }
 
   async function restoreIndexedDB(records) {
@@ -10338,6 +10629,7 @@ NOL3.pages.riders = function (root) {
 
   async function initialSyncChannel(channel) {
     const remote = await readRemoteFor(channel);
+    channel.lastStamp = remote ? (Date.parse(remote.updated_at) || 0) : 0;
     let local = await channel.buildSnapshot();
     const savedRemoteTime = Number(localStorage.getItem(channel.metaKey) || 0);
 
@@ -10361,6 +10653,16 @@ NOL3.pages.riders = function (root) {
     // A deliberate Clear is an authoritative empty snapshot. Never merge old
     // browser-local uploads back into it.
     if (channel === filesChannel && remoteSnapshot?.clearedByUser === true) {
+      await channel.applyRemote(remoteSnapshot);
+      channel.lastRemoteUpdatedAt = remoteTime;
+      channel.lastLocalMutationAt = remoteTime;
+      try { localStorage.setItem(channel.metaKey, String(remoteTime)); } catch (_) {}
+      channel.lastHash = stableHash(await channel.buildSnapshot());
+      channel.initialized = true;
+      return true;
+    }
+    // A deliberate roster clear is authoritative: remove stale local riders too.
+    if (channel === rosterChannel && remoteSnapshot?.clearedByUser === true && !snapshotHasData(channel, remoteSnapshot) && remoteTime > localTime) {
       await channel.applyRemote(remoteSnapshot);
       channel.lastRemoteUpdatedAt = remoteTime;
       channel.lastLocalMutationAt = remoteTime;
@@ -10489,7 +10791,12 @@ NOL3.pages.riders = function (root) {
         localStorage.setItem(channel.metaKey, String(channel.lastLocalMutationAt));
       }
 
+      const stamps = await getRemoteStamps();
+      const stamp = stamps[channel.dataType] || 0;
+      if (!stamp || stamp === channel.lastStamp) return false;   // unchanged: no download
+
       const remote = await readRemoteFor(channel);
+      const remoteStamp = remote ? (Date.parse(remote.updated_at) || stamp) : stamp;
       if (remote?.data) {
         const remoteTime = Number(remote.data.clientUpdatedAt || new Date(remote.updated_at || 0).getTime() || 0);
         if (remoteTime > channel.lastRemoteUpdatedAt && remoteTime > channel.lastLocalMutationAt) {
@@ -10498,9 +10805,11 @@ NOL3.pages.riders = function (root) {
           channel.lastLocalMutationAt = remoteTime;
           localStorage.setItem(channel.metaKey, String(remoteTime));
           channel.lastHash = stableHash(await channel.buildSnapshot());
+          channel.lastStamp = remoteStamp;
           return true;
         }
       }
+      channel.lastStamp = remoteStamp;
       return false;
     } finally {
       channel.syncing = false;
@@ -10586,9 +10895,22 @@ NOL3.pages.riders = function (root) {
     return emptySnapshot;
   }
 
+  async function clearRosterCloud() {
+    const snap = { version: 2, hubId: HUB_ID, hubName: HUB_NAME, hubCode: HUB_CODE, clientUpdatedAt: Date.now(), clearedAt: Date.now(), clearedByUser: true, riderData: null };
+    await pushSnapshotFor(rosterChannel, snap);
+    rosterChannel.initialized = true;
+    rosterChannel.lastHash = stableHash(await rosterChannel.buildSnapshot());
+    rosterChannel.lastRemoteUpdatedAt = snap.clientUpdatedAt;
+    rosterChannel.lastLocalMutationAt = snap.clientUpdatedAt;
+    try { localStorage.setItem(rosterChannel.metaKey, String(snap.clientUpdatedAt)); } catch (_) {}
+    return snap;
+  }
+
   window.NOL3CloudSync = {
     syncNow: syncOnce,
     clearUploadedFilesCloud,
+    clearRosterCloud,
+    usage: readEgress,
     hubId: HUB_ID,
     hubName: HUB_NAME,
     hubCode: HUB_CODE
@@ -10620,10 +10942,7 @@ NOL3.pages.riders = function (root) {
         NOL3.currentBusinessDate = today;
         NOL3Storage.set("nol3_business_day_date_v1", today);
       } catch (_) {}
-      initialSync().then(() => {
-        setInterval(syncSettingsAndRoster, settingsChannel.pollMs);
-        setInterval(syncFiles, filesChannel.pollMs);
-      });
+      initialSync().then(startAdaptivePolling);
     }, 1200);
   });
 
@@ -10928,14 +11247,6 @@ NOL3.pages.riders = function (root) {
     .fleet-overview-title{font-size:22px}
   }
 </style>
-<style id="fleet-overview-kpi-header-left-adjustment">
-  /* Keep the KPI card heading on the left; preserve the centered table header below. */
-  #page-fleet-overview > .fleet-overview-card:first-of-type .fleet-overview-card-title{
-    text-align:left !important;
-    justify-content:flex-start !important;
-  }
-</style>
-
 
 <script id="fleet-overview-module">
 (function(){
@@ -11160,9 +11471,9 @@ NOL3.pages.riders = function (root) {
             <div></div><div class="fleet-overview-kpi-head">Target To Achieve A+</div><div class="fleet-overview-kpi-head">Actual Number</div><div class="fleet-overview-kpi-head">Achievement Rate</div><div></div>
           </div>
           <div class="fleet-overview-kpi-body">
-            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Allmile Productivity</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverviewFPTarget" type="number" min="1" step="0.01" value="${fpTarget}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${Math.round(actualProd).toLocaleString()}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${((Number(fpTarget)||0)>0?(actualFP/Number(fpTarget))*100:0).toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.total.toLocaleString()} deployed / ${riders.length.toLocaleString()} active</div></div>
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Allmile Productivity</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverviewFPTarget" type="number" min="1" step="0.01" value="${fpTarget}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${actualFP.toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-rate">${((Number(fpTarget)||0)>0?(actualFP/Number(fpTarget))*100:0).toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.total.toLocaleString()} deployed / ${riders.length.toLocaleString()} active</div></div>
             <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">4WH Usage</div><div class="fleet-overview-kpi-col"><input class="fleet-overview-kpi-editor" id="fleetOverview4WHTarget" type="number" min="0" step="0.01" value="${fourTarget.toFixed(2)}"></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${actual4Usage.toFixed(2)}</div><div class="fleet-overview-kpi-col fleet-overview-rate">${inv(actual4Usage,fourTarget).toFixed(0)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">Actual 4WH ratio</div></div>
-            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Current SR</div><div class="fleet-overview-kpi-col"><span class="fleet-overview-kpi-editor-wrap"><input class="fleet-overview-kpi-editor" id="fleetOverviewSRTarget" type="number" min="0" max="100" step="0.01" value="${currentSRTargetPct}"><span>%</span></span></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value"></div><div class="fleet-overview-kpi-col fleet-overview-rate"></div><div class="fleet-overview-kpi-col fleet-overview-muted"></div></div>
+            <div class="fleet-overview-kpi-row"><div class="fleet-overview-kpi-label">Current SR</div><div class="fleet-overview-kpi-col"><span class="fleet-overview-kpi-editor-wrap"><input class="fleet-overview-kpi-editor" id="fleetOverviewSRTarget" type="number" min="0" max="100" step="0.01" value="${currentSRTargetPct}"><span>%</span></span></div><div class="fleet-overview-kpi-col fleet-overview-kpi-value">${currentSR.toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-rate">${currentSRAchievement.toFixed(2)}%</div><div class="fleet-overview-kpi-col fleet-overview-muted">${actual.total.toLocaleString()} deployed / ${riders.length.toLocaleString()} active</div></div>
           </div>
         </section>
 
@@ -11176,8 +11487,8 @@ NOL3.pages.riders = function (root) {
 
         <section class="fleet-overview-card">
           <div class="fleet-overview-card-head"><div class="fleet-overview-card-title">List of Deployed Riders</div><div class="fleet-overview-card-note">Parcel volume is distributed evenly among riders assigned to each Town Group</div></div>
-          <div class="fleet-overview-table-wrap"><table class="fleet-overview-table"><thead><tr><th class="left">Rider</th><th class="left">Fleet Type</th><th class="left">Cluster</th><th class="num">Parcels on Floor</th><th class="num">In Transit</th><th class="num">Total</th></tr></thead><tbody>
-          ${(()=>{const rmap=riderLookup(); const seen=new Set(); const body=[]; let floorTotal=0,inTransitTotal=0; const fleetCounts={}; rows.forEach(r=>r.riderDetails.forEach(d=>{const id=norm(d.id);if(seen.has(id))return;seen.add(id);const rd=rmap.get(id);const fleet=String(rd?.vehicleType||'').trim()||'Unspecified'; const floor=Number(d.onFloor||0);const transit=Number(d.inTransit||0);const riderTotal=floor+transit;floorTotal+=floor;inTransitTotal+=transit;fleetCounts[fleet]=(fleetCounts[fleet]||0)+1;body.push(`<tr><td class="left">${esc(rd?.name||d.id)}</td><td class="left">${esc(fleet)}</td><td class="left">${r.cluster} · ${esc(r.name)}</td><td class="num">${floor.toLocaleString()}</td><td class="num fleet-overview-in-transit">${transit.toLocaleString()}</td><td class="num"><b>${riderTotal.toLocaleString()}</b></td></tr>`);})); if(!body.length)return `<tr><td colspan="6" class="fleet-overview-empty">No riders are assigned to planning groups yet.</td></tr>`; const fleetSummary=Object.entries(fleetCounts).sort((a,b)=>a[0].localeCompare(b[0])).map(([type,count])=>`${esc(type)}: ${count.toLocaleString()}`).join(' · '); return body.join('')+`<tr class="fleet-overview-total"><td class="left">TOTAL RIDERS: ${seen.size.toLocaleString()}</td><td class="left">${fleetSummary||'—'}</td><td></td><td class="num">${floorTotal.toLocaleString()}</td><td class="num fleet-overview-in-transit">${inTransitTotal.toLocaleString()}</td><td class="num">${(floorTotal+inTransitTotal).toLocaleString()}</td></tr>`;})()}
+          <div class="fleet-overview-table-wrap"><table class="fleet-overview-table"><thead><tr><th class="left">Rider</th><th class="left">Fleet Type</th><th class="left">Cluster</th><th class="num">Parcels on Floor</th><th class="num">In Transit</th></tr></thead><tbody>
+          ${(()=>{const rmap=riderLookup(); const seen=new Set(); const body=[]; rows.forEach(r=>r.riderDetails.forEach(d=>{const id=norm(d.id);if(seen.has(id))return;seen.add(id);const rd=rmap.get(id);body.push(`<tr><td class="left">${esc(rd?.name||d.id)}</td><td class="left">${esc(rd?.vehicleType||'')}</td><td class="left">${r.cluster} · ${esc(r.name)}</td><td class="num">${Number(d.onFloor||0).toLocaleString()}</td><td class="num fleet-overview-in-transit">${Number(d.inTransit||0).toLocaleString()}</td></tr>`);})); return body.length?body.join(''):`<tr><td colspan="5" class="fleet-overview-empty">No riders are assigned to planning groups yet.</td></tr>`;})()}
           </tbody></table></div>
         </section>
       </div>`;
@@ -11220,6 +11531,61 @@ NOL3.pages.riders = function (root) {
   if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',()=>{try{NOL3.renderSidebar();NOL3.renderTopbar();NOL3.renderPage(NOL3.getState().currentPage);}catch(e){console.warn('Fleet Overview initialization failed',e);}});
   else{try{NOL3.renderSidebar();NOL3.renderTopbar();NOL3.renderPage(NOL3.getState().currentPage);}catch(e){console.warn('Fleet Overview initialization failed',e);}}
 })();
+</script>
+<script id="nol3-hub-row-filter">
+/* Keep only rows that belong to the selected hub:
+ * LM statuses      -> Current Station = Hub
+ * Incoming statuses-> Destination Station = Hub
+ * other statuses   -> Current OR Destination Station = Hub */
+NOL3.filterRowsToHub = function (headers, rows, kind) {
+  const hub = String((NOL3.getState && NOL3.getState().selectedHub) || "").trim().toLowerCase();
+  const list = Array.isArray(rows) ? rows : [];
+  if (!hub) return { rows: list, dropped: 0 };
+  const hs = (headers || []).map(h => String(h || "").replace(/^\uFEFF/, "").trim().toLowerCase());
+  const ci = hs.indexOf("current station"), di = hs.indexOf("destination station"), si = hs.indexOf("status");
+  if (ci < 0 && di < 0) return { rows: list, dropped: 0 };
+  const LM = new Set(["lmhub_received", "delivered", "delivering", "onhold"]);
+  const INC = new Set(["soc_lhtransported", "soc_lhtransporting", "soc_packed", "soc_packing"]);
+  const eq = (r, i) => i >= 0 && String(r[i] ?? "").trim().toLowerCase() === hub;
+  const kept = list.filter(r => {
+    let k = kind || "auto";
+    if (k === "auto") {
+      const st = si >= 0 ? String(r[si] || "").trim().toLowerCase() : "";
+      k = LM.has(st) ? "lm" : INC.has(st) ? "incoming" : "any";
+    }
+    if (k === "lm") return ci < 0 ? true : eq(r, ci);
+    if (k === "incoming") return di < 0 ? true : eq(r, di);
+    return eq(r, ci) || eq(r, di);
+  });
+  return { rows: kept, dropped: list.length - kept.length };
+};
+NOL3.rowsToCSV = function (headers, rows) {
+  const esc = v => { v = String(v ?? ""); return /[",\n\r]/.test(v) ? '"' + v.replace(/"/g, '""') + '"' : v; };
+  return [headers, ...rows].map(r => r.map(esc).join(",")).join("\r\n") + "\r\n";
+};
+</script>
+<script id="nol3-clear-riders">
+NOL3.clearRiderData = async function () {
+  const hub = (NOL3.getState && NOL3.getState().selectedHub) || "Badoc Hub";
+  NOL3.riderData = null;
+  try { window.NOL3RiderHubStore?.clear?.(hub); } catch (_) {}
+  try { window.NOL3FileStore?.remove("riders"); } catch (_) {}
+  // Unassign riders everywhere (memory + saved layout).
+  try {
+    (NOL3.deliveryAreas || []).forEach(a => (a.groups || []).forEach(g => { g.assignedRiders = []; }));
+    const raw = NOL3Storage.get("nol3_planning_layout_v1");
+    if (raw) {
+      const store = JSON.parse(raw);
+      const clean = arr => Array.isArray(arr) && arr.forEach(a => (a.groups || []).forEach(g => { g.assignedRiders = []; }));
+      if (Array.isArray(store)) clean(store); else if (store && store.byHub) clean(store.byHub[hub]);
+      NOL3Storage.set("nol3_planning_layout_v1", JSON.stringify(store));
+    }
+  } catch (_) {}
+  window.dispatchEvent(new CustomEvent("planningchanged", { detail: { type: "town-arrangement", source: "local" } }));
+  if (window.NOL3CloudSync?.clearRosterCloud) await window.NOL3CloudSync.clearRosterCloud();
+  window.dispatchEvent(new CustomEvent("inventoryloaded", { detail: { type: "riders", source: "hub-local" } }));
+  NOL3.renderPage("riders");
+};
 </script>
 </body>
 </html>
